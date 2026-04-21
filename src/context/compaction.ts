@@ -14,6 +14,9 @@ export interface CompactionContext {
 	taskFocus: TaskFocusState | null
 	recentWorkLog: string[]
 	recentVerifiedWork: string[]
+	executionPlanSummary: string
+	executionPhase: string
+	runtimeVerification: string[]
 	invokedSkills: string[]
 	relevantMemories: MemoryHeader[]
 	activePlugins: Array<{ name: string; version: string }>
@@ -25,10 +28,24 @@ export function buildCompactionContext(opts: {
 	plugins: LoadedCompatPlugin[]
 	invokedSkills: string[]
 	sessionState: SessionStateTracker
+	executionPlanSummary?: string
+	executionPhase?: string
+	runtimeVerification?: string[]
 	includeCavemem?: boolean
 	cavememDataDir?: string
 }): CompactionContext {
-	const { cwd, lastPrompt, plugins, invokedSkills, sessionState, includeCavemem, cavememDataDir } = opts
+	const {
+		cwd,
+		lastPrompt,
+		plugins,
+		invokedSkills,
+		sessionState,
+		executionPlanSummary,
+		executionPhase,
+		runtimeVerification,
+		includeCavemem,
+		cavememDataDir,
+	} = opts
 
 	const memories = lastPrompt
 		? findRelevantProjectMemories(lastPrompt, cwd, 3, {
@@ -41,6 +58,9 @@ export function buildCompactionContext(opts: {
 		taskFocus: sessionState.getTaskFocus(),
 		recentWorkLog: sessionState.getRecentWorkLog(),
 		recentVerifiedWork: sessionState.getRecentVerifiedWork(),
+		executionPlanSummary: executionPlanSummary ?? '',
+		executionPhase: executionPhase ?? '',
+		runtimeVerification: runtimeVerification ?? [],
 		invokedSkills,
 		relevantMemories: memories,
 		activePlugins: plugins
@@ -75,6 +95,16 @@ export function formatCompactionAttachments(ctx: CompactionContext): string {
 		const lines = ['[Compact attachment: relevant memories]']
 		for (const m of ctx.relevantMemories) {
 			lines.push(`- ${m.title}: ${m.description.slice(0, 120)}`)
+		}
+		parts.push(lines.join('\n'))
+	}
+
+	if (ctx.executionPlanSummary || ctx.executionPhase || ctx.runtimeVerification.length > 0) {
+		const lines = ['[Compact attachment: execution runtime]']
+		if (ctx.executionPhase) lines.push(`Phase: ${ctx.executionPhase}`)
+		if (ctx.executionPlanSummary) lines.push(`Plan: ${ctx.executionPlanSummary}`)
+		if (ctx.runtimeVerification.length > 0) {
+			lines.push(`Verify: ${ctx.runtimeVerification.slice(-3).join('; ')}`)
 		}
 		parts.push(lines.join('\n'))
 	}

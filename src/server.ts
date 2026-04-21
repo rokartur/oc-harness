@@ -38,6 +38,13 @@ import {
 } from './memory/index.js'
 import { HookExecutionLog, createDiagnosticsTool, createMemoryStatsTool, createHookLogTool } from './tui.js'
 import { tool as toolFn } from '@opencode-ai/plugin'
+import {
+	compileUserPrompt,
+	buildExecutionPlan,
+	renderExecutionPlan,
+	summarizeExecutionPlan,
+	SessionRuntimeTracker,
+} from './runtime/index.js'
 import type { PluginConfig, CompatHook, LoadedCompatPlugin } from './shared/types.js'
 import { injectCavememMcp, isCavememAvailable } from './shared/cavemem.js'
 import { isRtkAvailable, rewriteCommandWithRtk } from './shared/rtk.js'
@@ -133,6 +140,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 	const allSkills = plugins.filter(p => p.enabled).flatMap(p => p.skills)
 
 	const sessionStateBySession = new Map<string, SessionStateTracker>()
+	const sessionRuntimeBySession = new Map<string, SessionRuntimeTracker>()
 	const invokedSkillsBySession = new Map<string, Set<string>>()
 	const cavemanStateBySession = new Map<string, { enabled: boolean; mode: CavemanMode }>()
 	const persistentHookContextBySession = new Map<string, string[]>()
@@ -156,6 +164,15 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		const created = new SessionStateTracker()
 		sessionStateBySession.set(sessionID, created)
 		trimSessionCache(sessionStateBySession, MAX_SESSION_CACHE)
+		return created
+	}
+
+	function getSessionRuntime(sessionID: string): SessionRuntimeTracker {
+		const existing = sessionRuntimeBySession.get(sessionID)
+		if (existing) return existing
+		const created = new SessionRuntimeTracker()
+		sessionRuntimeBySession.set(sessionID, created)
+		trimSessionCache(sessionRuntimeBySession, MAX_SESSION_CACHE)
 		return created
 	}
 
@@ -212,6 +229,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 	function clearSession(sessionID: string): void {
 		lastPromptBySession.delete(sessionID)
 		sessionStateBySession.delete(sessionID)
+		sessionRuntimeBySession.delete(sessionID)
 		invokedSkillsBySession.delete(sessionID)
 		cavemanStateBySession.delete(sessionID)
 		persistentHookContextBySession.delete(sessionID)
@@ -383,6 +401,8 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				})
 			}
 			const sessionState = getSessionState(hookInput.sessionID)
+			const sessionRuntime = getSessionRuntime(hookInput.sessionID)
+			sessionRuntime.noteTool(hookInput.tool, hookInput.args)
 			sessionState.addWorkLogEntry(
 				`${hookInput.tool}${hookInput.args ? `: ${truncateStr(JSON.stringify(hookInput.args), 80)}` : ''}`,
 			)
@@ -396,6 +416,8 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				if (path) sessionState.addArtifact(path)
 			}
 			maybeRecordVerificationState(sessionState, hookInput, toolOutput)
+			const verificationSummary = getVerificationSummary(hookInput, toolOutput)
+			if (verificationSummary) sessionRuntime.noteVerification(verificationSummary)
 			maybeSetNextStep(sessionState, hookInput)
 		},
 
@@ -410,12 +432,16 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			}
 
 			if (config.enableCompaction) {
+				const runtimeSnapshot = getSessionRuntime(hookInput.sessionID).snapshot()
 				const ctx = buildCompactionContext({
 					cwd,
 					lastPrompt: getLastPrompt(lastPromptBySession, hookInput.sessionID),
 					plugins,
 					invokedSkills: getInvokedSkills(hookInput.sessionID),
 					sessionState: getSessionState(hookInput.sessionID),
+					executionPlanSummary: runtimeSnapshot.plan ? summarizeExecutionPlan(runtimeSnapshot.plan) : '',
+					executionPhase: runtimeSnapshot.phase,
+					runtimeVerification: runtimeSnapshot.verificationSummary,
 					includeCavemem: config.enableCavememBridge !== false,
 					cavememDataDir: config.cavememDataDir,
 				})
@@ -429,6 +455,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		'experimental.chat.system.transform': async (_input, output) => {
 			const sessionID = _input.sessionID
 			const cavemanState = getCavemanState(sessionID)
+			const runtimeSnapshot = sessionID ? getSessionRuntime(sessionID).snapshot() : null
 			if (cavemanState.enabled) {
 				output.system.push(buildCavemanSystemPrompt(cavemanState.mode))
 			}
@@ -457,6 +484,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			const claudeRules = config.enableClaudeRulesCompat ? discoverClaudeRules(cwd) : []
 
 			const allContext = [...rootContext, ...extraContexts, ...claudeRules]
+
+			if (runtimeSnapshot?.plan) {
+				output.system.push(renderExecutionPlan(runtimeSnapshot.plan, runtimeSnapshot.phase))
+			}
 
 			if (config.enableMemory) {
 				const lastPrompt = getLastPrompt(lastPromptBySession, sessionID)
@@ -527,6 +558,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 		'chat.message': async (hookInput, output) => {
 			const prompt = extractUserPrompt(output.parts)
+			const sessionRuntime = getSessionRuntime(hookInput.sessionID)
 			const directive = detectCavemanDirective(prompt)
 			if (directive) {
 				updateCavemanState(hookInput.sessionID, directive)
@@ -544,6 +576,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				setHookContext(promptHookContextBySession, hookInput.sessionID, collectHookContext(results))
 			}
 			if (prompt) {
+				sessionRuntime.setPhase('compile-prompt')
 				if (config.enableCavememBridge !== false) {
 					recordCaveMemUserPrompt(hookInput.sessionID, cwd, prompt, {
 						dataDir: config.cavememDataDir,
@@ -551,8 +584,32 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					})
 				}
 				setLastPrompt(hookInput.sessionID, prompt)
+				const compiledPrompt = compileUserPrompt(prompt)
+				sessionRuntime.setCompiledPrompt(compiledPrompt)
+				const planningRootContext = discoverRootContext(cwd, {
+					claudeMd: config.enableClaudeMdContext !== false,
+					agentsMd: config.enableAgentsMdContext !== false,
+					spec: config.enableCavekitSpecContext !== false,
+				})
+				const planningMemories = config.enableMemory
+					? findRelevantProjectMemories(prompt, cwd, 3, {
+							includeCavemem: config.enableCavememBridge !== false,
+							cavememDataDir: config.cavememDataDir,
+						})
+					: []
+				const sessionState = getSessionState(hookInput.sessionID)
+				const plan = buildExecutionPlan({
+					compiledPrompt,
+					rootContext: planningRootContext,
+					memories: planningMemories,
+					taskFocus: sessionState.getTaskFocus(),
+				})
+				sessionRuntime.setPlan(plan)
+				sessionState.updateGoal(plan.goal)
+				sessionState.setNextStep(plan.steps[0]?.title ?? 'Apply next planned step and verify result.')
 			} else if (hookInput.messageID) {
 				getSessionState(hookInput.sessionID)
+				getSessionRuntime(hookInput.sessionID)
 			}
 		},
 
@@ -564,6 +621,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					dataDir: config.cavememDataDir,
 					mode: getCavemanState(sessionId).mode,
 				})
+			}
+			if (type === 'session.created' && sessionId) {
+				getSessionRuntime(sessionId).setPhase('load-context')
 			}
 
 			if (config.enableHooks) {
@@ -718,6 +778,18 @@ function maybeRecordVerificationState(
 		sessionState.addVerifiedState(`Verified: ${truncateStr(command, 100)}`)
 		sessionState.setNextStep('Summarize the verified work or continue with the next change.')
 	}
+}
+
+function getVerificationSummary(
+	hookInput: { tool: string; args: any },
+	toolOutput: { title: string; output: string; metadata: any },
+): string {
+	if (hookInput.tool !== 'bash') return ''
+	const command = typeof hookInput.args?.command === 'string' ? hookInput.args.command : ''
+	if (!command) return ''
+	if (!/\b(test|build|typecheck|check|lint)\b/.test(command.toLowerCase())) return ''
+	const exitCode = typeof toolOutput.metadata?.exitCode === 'number' ? toolOutput.metadata.exitCode : 0
+	return `${truncateStr(command, 100)} [${exitCode === 0 ? 'pass' : `fail:${exitCode}`}]`
 }
 
 function maybeSetNextStep(sessionState: SessionStateTracker, hookInput: { tool: string; args: any }): void {
