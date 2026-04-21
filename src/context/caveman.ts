@@ -69,6 +69,7 @@ export function buildCavemanSystemPrompt(mode: CavemanMode): string {
 export function detectCavemanDirective(input: string): CavemanDirective | null {
 	const text = input.trim().toLowerCase()
 	if (!text) return null
+	const requestedMode = detectRequestedMode(text)
 
 	if (text === '/caveman' || text === '/caveman full') {
 		return { enabled: true, mode: 'full' }
@@ -93,10 +94,17 @@ export function detectCavemanDirective(input: string): CavemanDirective | null {
 		/\bcaveman\b.*\b(mode|on|please|again)\b/.test(text) ||
 		/\bless tokens please\b/.test(text)
 	) {
-		return { enabled: true }
+		return { enabled: true, ...(requestedMode ? { mode: requestedMode } : {}) }
 	}
 
 	return null
+}
+
+function detectRequestedMode(text: string): CavemanMode | undefined {
+	if (/\bultra\b/.test(text)) return 'ultra'
+	if (/\blite\b/.test(text)) return 'lite'
+	if (/\bfull\b/.test(text)) return 'full'
+	return undefined
 }
 
 export function compressForCaveman(input: string, mode: CavemanMode = 'full'): string {
