@@ -1,4 +1,4 @@
-import { findRelevantMemories } from '../memory/search.js'
+import { findRelevantProjectMemories } from '../memory/search.js'
 import type { MemoryHeader } from '../memory/scan.js'
 import type { LoadedCompatPlugin } from '../shared/types.js'
 
@@ -25,10 +25,17 @@ export function buildCompactionContext(opts: {
 	plugins: LoadedCompatPlugin[]
 	invokedSkills: string[]
 	sessionState: SessionStateTracker
+	includeCavemem?: boolean
+	cavememDataDir?: string
 }): CompactionContext {
-	const { cwd, lastPrompt, plugins, invokedSkills, sessionState } = opts
+	const { cwd, lastPrompt, plugins, invokedSkills, sessionState, includeCavemem, cavememDataDir } = opts
 
-	const memories = lastPrompt ? findRelevantMemories(lastPrompt, cwd, 3) : []
+	const memories = lastPrompt
+		? findRelevantProjectMemories(lastPrompt, cwd, 3, {
+				includeCavemem,
+				cavememDataDir,
+			})
+		: []
 
 	return {
 		taskFocus: sessionState.getTaskFocus(),

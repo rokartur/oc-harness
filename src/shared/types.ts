@@ -110,12 +110,20 @@ export interface PluginConfig {
 	enableMemory?: boolean
 	enableCompaction?: boolean
 	enableClaudeRulesCompat?: boolean
+	enableClaudeMdContext?: boolean
+	enableAgentsMdContext?: boolean
+	enableCavekitSpecContext?: boolean
+	enableContextArtifactCompression?: boolean
 	enableIssueContext?: boolean
 	enablePrCommentsContext?: boolean
 	enableActiveRepoContext?: boolean
 	enableCavemanInputCompression?: boolean
 	enableCavemanOutputCompression?: boolean
 	cavemanMode?: 'lite' | 'full' | 'ultra'
+	enableCavememBridge?: boolean
+	enableCavememMcp?: boolean
+	cavememBinary?: string
+	cavememDataDir?: string
 	enableRtk?: boolean
 	rtkBinary?: string
 }

@@ -14,6 +14,12 @@ export interface ExtraContextOptions {
 	activeRepo?: boolean
 }
 
+export interface RootContextOptions {
+	claudeMd?: boolean
+	agentsMd?: boolean
+	spec?: boolean
+}
+
 export function discoverExtraContext(cwd: string, options: ExtraContextOptions = {}): ExtraContext[] {
 	const contexts: ExtraContext[] = []
 
@@ -65,6 +71,42 @@ export function discoverClaudeRules(cwd: string): ExtraContext[] {
 				label: `Rule: ${entry}`,
 				content: content.trim().slice(0, MAX_CHARS_PER_FILE),
 				source: full,
+			})
+		}
+	}
+
+	return contexts
+}
+
+export function discoverRootContext(cwd: string, options: RootContextOptions = {}): ExtraContext[] {
+	const contexts: ExtraContext[] = []
+
+	const sources: Array<{ enabled: boolean; path: string; label: string }> = [
+		{
+			enabled: options.claudeMd !== false,
+			path: join(cwd, 'CLAUDE.md'),
+			label: 'CLAUDE.md',
+		},
+		{
+			enabled: options.agentsMd !== false,
+			path: join(cwd, 'AGENTS.md'),
+			label: 'AGENTS.md',
+		},
+		{
+			enabled: options.spec !== false,
+			path: join(cwd, 'SPEC.md'),
+			label: 'CaveKit Spec',
+		},
+	]
+
+	for (const { enabled, path, label } of sources) {
+		if (!enabled) continue
+		const content = readFileText(path)
+		if (content && content.trim()) {
+			contexts.push({
+				label,
+				content: content.trim().slice(0, MAX_CHARS_PER_FILE),
+				source: path,
 			})
 		}
 	}

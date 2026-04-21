@@ -8,7 +8,12 @@ import {
 	formatReport,
 } from './compat/index.js'
 import { executeHook, matchesHook, mapOpenHarnessEventToOpenCode } from './compat/hooks-executor.js'
-import { discoverExtraContext, discoverClaudeRules } from './context/index.js'
+import {
+	discoverExtraContext,
+	discoverClaudeRules,
+	discoverRootContext,
+	ContextArtifactCache,
+} from './context/index.js'
 import {
 	buildCavemanSystemPrompt,
 	compressForCaveman,
@@ -22,23 +27,29 @@ import {
 	truncateCompactionContext,
 } from './context/compaction.js'
 import {
-	memoryListTool,
-	memoryReadTool,
-	memorySearchTool,
-	memoryWriteTool,
-	memoryDeleteTool,
-	memoryIndexTool,
-	findRelevantMemories,
+	createMemoryTools,
+	findRelevantProjectMemories,
+	startCaveMemSession,
+	endCaveMemSession,
+	recordCaveMemUserPrompt,
+	recordCaveMemToolUse,
+	recordCaveMemSessionSummary,
+	countCaveMemProjectObservations,
 } from './memory/index.js'
 import { HookExecutionLog, createDiagnosticsTool, createMemoryStatsTool, createHookLogTool } from './tui.js'
 import { tool as toolFn } from '@opencode-ai/plugin'
 import type { PluginConfig, CompatHook, LoadedCompatPlugin } from './shared/types.js'
+import { injectCavememMcp, isCavememAvailable } from './shared/cavemem.js'
 import { isRtkAvailable, rewriteCommandWithRtk } from './shared/rtk.js'
 
 const z = toolFn.schema
 
 export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 	const cavemanMode = normalizeCavemanMode(options?.cavemanMode)
+	const cavememBinary =
+		typeof options?.cavememBinary === 'string' && options.cavememBinary.trim()
+			? options.cavememBinary.trim()
+			: 'cavemem'
 	const rtkBinary =
 		typeof options?.rtkBinary === 'string' && options.rtkBinary.trim() ? options.rtkBinary.trim() : 'rtk'
 
@@ -50,16 +61,25 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		enableMemory: options?.enableMemory !== false,
 		enableCompaction: options?.enableCompaction !== false,
 		enableClaudeRulesCompat: options?.enableClaudeRulesCompat !== false,
+		enableClaudeMdContext: options?.enableClaudeMdContext !== false,
+		enableAgentsMdContext: options?.enableAgentsMdContext !== false,
+		enableCavekitSpecContext: options?.enableCavekitSpecContext !== false,
+		enableContextArtifactCompression: options?.enableContextArtifactCompression !== false,
 		enableIssueContext: options?.enableIssueContext !== false,
 		enablePrCommentsContext: options?.enablePrCommentsContext !== false,
 		enableActiveRepoContext: options?.enableActiveRepoContext !== false,
 		enableCavemanInputCompression: options?.enableCavemanInputCompression === true,
 		enableCavemanOutputCompression: options?.enableCavemanOutputCompression !== false,
 		cavemanMode,
+		enableCavememBridge: options?.enableCavememBridge !== false,
+		enableCavememMcp: options?.enableCavememMcp !== false,
+		cavememBinary,
+		cavememDataDir: typeof options?.cavememDataDir === 'string' ? options.cavememDataDir : undefined,
 		enableRtk: options?.enableRtk === true,
 		rtkBinary,
 	}
 
+	const cavememAvailable = config.enableCavememMcp ? isCavememAvailable(cavememBinary) : false
 	const rtkAvailable = config.enableRtk ? isRtkAvailable(rtkBinary) : false
 
 	const cwd = input.directory
@@ -98,6 +118,16 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		})
 	}
 
+	if (config.enableCavememMcp && !cavememAvailable) {
+		await input.client.app.log({
+			body: {
+				service: 'opencode-harness',
+				level: 'warn',
+				message: `CaveMem MCP enabled but binary '${cavememBinary}' is unavailable. Native CaveMem MCP disabled.`,
+			},
+		})
+	}
+
 	const allHooks = plugins.filter(p => p.enabled).flatMap(p => p.hooks)
 
 	const allSkills = plugins.filter(p => p.enabled).flatMap(p => p.skills)
@@ -108,6 +138,14 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 	const persistentHookContextBySession = new Map<string, string[]>()
 	const promptHookContextBySession = new Map<string, string[]>()
 	const hookLog = new HookExecutionLog()
+	const contextArtifacts = new ContextArtifactCache()
+	const memoryTools = createMemoryTools({
+		cavemem: {
+			enabled: config.enableCavememBridge !== false,
+			dataDir: config.cavememDataDir,
+			resolveMode: sessionID => getCavemanState(sessionID).mode,
+		},
+	})
 
 	const lastPromptBySession = new Map<string, string>()
 	const MAX_SESSION_CACHE = 50
@@ -242,6 +280,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 	return {
 		config: async cfg => {
 			const diagnostics = injectIntoConfig(cfg, plugins)
+			if (config.enableCavememMcp && cavememAvailable) {
+				injectCavememMcp(cfg, cavememBinary)
+			}
 			for (const d of diagnostics) {
 				await input.client.app.log({
 					body: {
@@ -254,16 +295,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		},
 
 		tool: {
-			...(config.enableMemory
-				? {
-						openharness_memory_list: memoryListTool,
-						openharness_memory_read: memoryReadTool,
-						openharness_memory_search: memorySearchTool,
-						openharness_memory_write: memoryWriteTool,
-						openharness_memory_delete: memoryDeleteTool,
-						openharness_memory_index: memoryIndexTool,
-					}
-				: {}),
+			...(config.enableMemory ? memoryTools : {}),
 			...(allSkills.length > 0
 				? {
 						openharness_skill: toolFn({
@@ -295,7 +327,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						mcpServers: Object.keys(p.mcpServers).length,
 					})),
 			),
-			openharness_memory_stats: createMemoryStatsTool(),
+			openharness_memory_stats: createMemoryStatsTool(directory => {
+				if (config.enableCavememBridge === false) return []
+				return [
+					`CaveMem observations: ${countCaveMemProjectObservations(directory, { dataDir: config.cavememDataDir })}`,
+				]
+			}),
 			openharness_hook_log: createHookLogTool(() => hookLog),
 		},
 
@@ -339,6 +376,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					args: hookInput.args,
 				})
 			}
+			if (config.enableCavememBridge !== false) {
+				recordCaveMemToolUse(hookInput.sessionID, cwd, hookInput.tool, hookInput.args, toolOutput, {
+					dataDir: config.cavememDataDir,
+					mode: getCavemanState(hookInput.sessionID).mode,
+				})
+			}
 			const sessionState = getSessionState(hookInput.sessionID)
 			sessionState.addWorkLogEntry(
 				`${hookInput.tool}${hookInput.args ? `: ${truncateStr(JSON.stringify(hookInput.args), 80)}` : ''}`,
@@ -373,6 +416,8 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					plugins,
 					invokedSkills: getInvokedSkills(hookInput.sessionID),
 					sessionState: getSessionState(hookInput.sessionID),
+					includeCavemem: config.enableCavememBridge !== false,
+					cavememDataDir: config.cavememDataDir,
 				})
 				const formatted = formatCompactionAttachments(ctx)
 				if (formatted) {
@@ -404,14 +449,22 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				prComments: config.enablePrCommentsContext !== false,
 				activeRepo: config.enableActiveRepoContext !== false,
 			})
+			const rootContext = discoverRootContext(cwd, {
+				claudeMd: config.enableClaudeMdContext !== false,
+				agentsMd: config.enableAgentsMdContext !== false,
+				spec: config.enableCavekitSpecContext !== false,
+			})
 			const claudeRules = config.enableClaudeRulesCompat ? discoverClaudeRules(cwd) : []
 
-			const allContext = [...extraContexts, ...claudeRules]
+			const allContext = [...rootContext, ...extraContexts, ...claudeRules]
 
 			if (config.enableMemory) {
 				const lastPrompt = getLastPrompt(lastPromptBySession, sessionID)
 				if (lastPrompt) {
-					const memories = findRelevantMemories(lastPrompt, cwd, 3)
+					const memories = findRelevantProjectMemories(lastPrompt, cwd, 3, {
+						includeCavemem: config.enableCavememBridge !== false,
+						cavememDataDir: config.cavememDataDir,
+					})
 					for (const mem of memories) {
 						allContext.push({
 							label: `Memory: ${mem.title}`,
@@ -424,7 +477,22 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 			if (allContext.length === 0) return
 
-			const section = allContext.map(ctx => `## ${ctx.label}\n\`\`\`md\n${ctx.content}\n\`\`\``).join('\n\n')
+			const compiledContext =
+				config.enableContextArtifactCompression !== false
+					? contextArtifacts.compileAll(allContext, cavemanState.mode)
+					: allContext.map(ctx => ({
+							...ctx,
+							compressed: false,
+							originalChars: ctx.content.length,
+							artifactChars: ctx.content.length,
+						}))
+
+			const section = compiledContext
+				.map(ctx => {
+					const heading = ctx.compressed ? `${ctx.label} [cave artifact]` : ctx.label
+					return `## ${heading}\n\`\`\`md\n${ctx.content}\n\`\`\``
+				})
+				.join('\n\n')
 
 			output.system.push(`# OpenHarness Compatibility Context\n\n${section}`)
 		},
@@ -476,6 +544,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				setHookContext(promptHookContextBySession, hookInput.sessionID, collectHookContext(results))
 			}
 			if (prompt) {
+				if (config.enableCavememBridge !== false) {
+					recordCaveMemUserPrompt(hookInput.sessionID, cwd, prompt, {
+						dataDir: config.cavememDataDir,
+						mode: getCavemanState(hookInput.sessionID).mode,
+					})
+				}
 				setLastPrompt(hookInput.sessionID, prompt)
 			} else if (hookInput.messageID) {
 				getSessionState(hookInput.sessionID)
@@ -485,6 +559,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		event: async ({ event }) => {
 			const type = event.type as string
 			const sessionId = extractSessionId(event)
+			if (config.enableCavememBridge !== false && type === 'session.created' && sessionId) {
+				startCaveMemSession(sessionId, cwd, {
+					dataDir: config.cavememDataDir,
+					mode: getCavemanState(sessionId).mode,
+				})
+			}
 
 			if (config.enableHooks) {
 				if (type === 'session.created' && sessionId) {
@@ -501,6 +581,19 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			}
 
 			if (type === 'session.deleted' && sessionId) {
+				if (config.enableCavememBridge !== false) {
+					const summary = buildSessionSummary(
+						getSessionState(sessionId),
+						getLastPrompt(lastPromptBySession, sessionId),
+					)
+					if (summary) {
+						recordCaveMemSessionSummary(sessionId, cwd, summary, {
+							dataDir: config.cavememDataDir,
+							mode: getCavemanState(sessionId).mode,
+						})
+					}
+					endCaveMemSession(sessionId, { dataDir: config.cavememDataDir })
+				}
 				clearSession(sessionId)
 			}
 		},
@@ -636,6 +729,19 @@ function maybeSetNextStep(sessionState: SessionStateTracker, hookInput: { tool: 
 	if (hookInput.tool === 'openharness_skill') {
 		sessionState.setNextStep('Use the loaded compatibility skill while continuing the current task.')
 	}
+}
+
+function buildSessionSummary(sessionState: SessionStateTracker, lastPrompt: string): string {
+	const focus = sessionState.getTaskFocus()
+	const lines: string[] = []
+	if (lastPrompt) lines.push(`Last prompt: ${truncateStr(lastPrompt, 240)}`)
+	if (focus.goal) lines.push(`Goal: ${truncateStr(focus.goal, 240)}`)
+	if (focus.nextStep) lines.push(`Next step: ${truncateStr(focus.nextStep, 240)}`)
+	if (focus.activeArtifacts.length > 0) lines.push(`Artifacts: ${focus.activeArtifacts.slice(-5).join(', ')}`)
+	if (focus.verifiedState.length > 0) lines.push(`Verified: ${focus.verifiedState.slice(-3).join('; ')}`)
+	const recentWork = sessionState.getRecentWorkLog().slice(-3)
+	if (recentWork.length > 0) lines.push(`Recent work: ${recentWork.join(' | ')}`)
+	return lines.join('\n')
 }
 
 function normalizeCavemanMode(raw: unknown): CavemanMode {

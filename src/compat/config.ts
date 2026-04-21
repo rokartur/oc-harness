@@ -41,6 +41,36 @@ const BUILTIN_COMMANDS: Record<string, { template: string; description: string }
 			'Output comments only, ready to paste into a PR review.',
 		].join(' '),
 	},
+	'ck-spec': {
+		description: 'Create or amend a CaveKit SPEC.md',
+		template: [
+			'Read or create repo-root `SPEC.md` using CaveKit v4 structure: `§G GOAL`, `§C CONSTRAINTS`, `§I INTERFACES`, `§V INVARIANTS`, `§T TASKS`, `§B BUGS`.',
+			'Treat `$ARGUMENTS` as the requested scope, goal, or amendment.',
+			'Keep fixed section order, one-file rule, and CaveKit-style caveman compression for spec prose while preserving code, paths, identifiers, URLs, numbers, and exact errors verbatim.',
+			'If `SPEC.md` exists, update only the sections that changed and keep task ids monotonic.',
+			'If new bugs or regressions are discovered, append them under `§B` and add or tighten invariants in `§V`.',
+		].join(' '),
+	},
+	'ck-build': {
+		description: 'Implement the next CaveKit SPEC.md task',
+		template: [
+			'Read repo-root `SPEC.md` first.',
+			'Select the next unfinished or in-progress task from `§T TASKS`, implement the minimal correct diff, and keep work aligned with cited interfaces and invariants.',
+			'Update task state as work progresses: `.` -> `~` -> `x` only when the task is actually complete and verified.',
+			'If validation fails, backprop the failure into `§B BUGS` and add the missing guardrail in `§V INVARIANTS` before continuing.',
+			'Treat `$ARGUMENTS` as an optional task selector, scope, or constraint override.',
+		].join(' '),
+	},
+	'ck-check': {
+		description: 'Compare the repo against CaveKit SPEC.md',
+		template: [
+			'Read repo-root `SPEC.md` and perform a read-only drift check.',
+			'Compare current code and behavior against `§I INTERFACES`, `§V INVARIANTS`, and `§T TASKS`.',
+			'Report violations and gaps with exact section references like `§V.2` or task ids like `T3`.',
+			'Treat `$ARGUMENTS` as an optional focus area, file path, or subsystem to check first.',
+			'Do not edit files unless the user explicitly asks for fixes after the report.',
+		].join(' '),
+	},
 }
 
 export function injectIntoConfig(

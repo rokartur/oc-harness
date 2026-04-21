@@ -1,4 +1,11 @@
-export { discoverExtraContext, discoverClaudeRules, type ExtraContext } from './instructions.js'
+export {
+	discoverExtraContext,
+	discoverClaudeRules,
+	discoverRootContext,
+	type ExtraContext,
+	type RootContextOptions,
+} from './instructions.js'
+export { ContextArtifactCache, buildContextArtifact, type ContextArtifact } from './artifacts.js'
 export {
 	SessionStateTracker,
 	buildCompactionContext,

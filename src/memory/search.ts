@@ -1,4 +1,10 @@
 import { scanMemoryFiles, type MemoryHeader } from './scan.js'
+import { searchCaveMemProject } from './cavemem.js'
+
+export interface ProjectMemorySearchOptions {
+	includeCavemem?: boolean
+	cavememDataDir?: string
+}
 
 export function findRelevantMemories(query: string, cwd: string, maxResults: number = 5): MemoryHeader[] {
 	const tokens = Array.from(tokenize(query))
@@ -21,6 +27,37 @@ export function findRelevantMemories(query: string, cwd: string, maxResults: num
 
 	scored.sort((a, b) => b[0] - a[0])
 	return scored.slice(0, maxResults).map(([, h]) => h)
+}
+
+export function findRelevantProjectMemories(
+	query: string,
+	cwd: string,
+	maxResults: number = 5,
+	options: ProjectMemorySearchOptions = {},
+): MemoryHeader[] {
+	const legacy = findRelevantMemories(query, cwd, maxResults * 2).map((header, index) => ({
+		header,
+		score: maxResults * 2 - index,
+	}))
+	const cavemem = options.includeCavemem
+		? searchCaveMemProject(query, cwd, maxResults * 2, { dataDir: options.cavememDataDir })
+		: []
+
+	const merged = new Map<string, { header: MemoryHeader; score: number }>()
+	for (const entry of legacy) {
+		merged.set(entry.header.path, entry)
+	}
+	for (const entry of cavemem) {
+		const existing = merged.get(entry.path)
+		if (!existing || entry.score > existing.score) {
+			merged.set(entry.path, { header: entry, score: entry.score })
+		}
+	}
+
+	return Array.from(merged.values())
+		.sort((a, b) => b.score - a.score || b.header.modifiedAt - a.header.modifiedAt)
+		.slice(0, maxResults)
+		.map(entry => entry.header)
 }
 
 function tokenize(text: string): Set<string> {

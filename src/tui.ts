@@ -135,7 +135,7 @@ export function createDiagnosticsTool(
 	})
 }
 
-export function createMemoryStatsTool(): ToolDefinition {
+export function createMemoryStatsTool(getExtraStats?: (directory: string) => Array<string>): ToolDefinition {
 	return tool({
 		description:
 			'Show OpenHarness memory statistics for the current project: file count, total size, and recent files.',
@@ -143,7 +143,9 @@ export function createMemoryStatsTool(): ToolDefinition {
 		async execute(_args, ctx) {
 			const memDir = getProjectMemoryDir(ctx.directory)
 			if (!dirExists(memDir)) {
-				return 'No memory directory found for this project.'
+				const extra = getExtraStats?.(ctx.directory) ?? []
+				if (extra.length === 0) return 'No memory directory found for this project.'
+				return ['## Memory Statistics', '', ...extra].join('\n')
 			}
 
 			const files = listMemoryFiles(ctx.directory)
@@ -179,6 +181,11 @@ export function createMemoryStatsTool(): ToolDefinition {
 				'',
 				'### Recent files',
 			]
+
+			const extra = getExtraStats?.(ctx.directory) ?? []
+			if (extra.length > 0) {
+				lines.splice(5, 0, ...extra)
+			}
 
 			for (const f of fileDetails.slice(0, 10)) {
 				const age = timeAgo(f.modified)
