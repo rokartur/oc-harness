@@ -9,7 +9,12 @@ import {
 } from './compat/index.js'
 import { executeHook, matchesHook, mapOpenHarnessEventToOpenCode } from './compat/hooks-executor.js'
 import { discoverExtraContext, discoverClaudeRules } from './context/index.js'
-import { buildCavemanSystemPrompt, compressForCaveman, type CavemanMode } from './context/caveman.js'
+import {
+	buildCavemanSystemPrompt,
+	compressForCaveman,
+	detectCavemanDirective,
+	type CavemanMode,
+} from './context/caveman.js'
 import {
 	SessionStateTracker,
 	buildCompactionContext,
@@ -49,7 +54,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		enablePrCommentsContext: options?.enablePrCommentsContext !== false,
 		enableActiveRepoContext: options?.enableActiveRepoContext !== false,
 		enableCavemanInputCompression: options?.enableCavemanInputCompression === true,
-		enableCavemanOutputCompression: options?.enableCavemanOutputCompression === true,
+		enableCavemanOutputCompression: options?.enableCavemanOutputCompression !== false,
 		cavemanMode,
 		enableRtk: options?.enableRtk === true,
 		rtkBinary,
@@ -99,6 +104,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 	const sessionStateBySession = new Map<string, SessionStateTracker>()
 	const invokedSkillsBySession = new Map<string, Set<string>>()
+	const cavemanStateBySession = new Map<string, { enabled: boolean; mode: CavemanMode }>()
 	const persistentHookContextBySession = new Map<string, string[]>()
 	const promptHookContextBySession = new Map<string, string[]>()
 	const hookLog = new HookExecutionLog()
@@ -117,6 +123,35 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 	function getInvokedSkills(sessionID: string): string[] {
 		return Array.from(invokedSkillsBySession.get(sessionID) ?? [])
+	}
+
+	function getCavemanState(sessionID?: string): { enabled: boolean; mode: CavemanMode } {
+		if (!sessionID) {
+			return {
+				enabled: config.enableCavemanOutputCompression !== false,
+				mode: config.cavemanMode ?? 'full',
+			}
+		}
+
+		const existing = cavemanStateBySession.get(sessionID)
+		if (existing) return existing
+
+		const created = {
+			enabled: config.enableCavemanOutputCompression !== false,
+			mode: config.cavemanMode ?? 'full',
+		}
+		cavemanStateBySession.set(sessionID, created)
+		trimSessionCache(cavemanStateBySession, MAX_SESSION_CACHE)
+		return created
+	}
+
+	function updateCavemanState(sessionID: string, next: Partial<{ enabled: boolean; mode: CavemanMode }>): void {
+		const current = getCavemanState(sessionID)
+		cavemanStateBySession.set(sessionID, {
+			enabled: next.enabled ?? current.enabled,
+			mode: next.mode ?? current.mode,
+		})
+		trimSessionCache(cavemanStateBySession, MAX_SESSION_CACHE)
 	}
 
 	function recordInvokedSkill(sessionID: string, skillName: string): void {
@@ -140,6 +175,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		lastPromptBySession.delete(sessionID)
 		sessionStateBySession.delete(sessionID)
 		invokedSkillsBySession.delete(sessionID)
+		cavemanStateBySession.delete(sessionID)
 		persistentHookContextBySession.delete(sessionID)
 		promptHookContextBySession.delete(sessionID)
 	}
@@ -347,8 +383,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 		'experimental.chat.system.transform': async (_input, output) => {
 			const sessionID = _input.sessionID
-			if (config.enableCavemanOutputCompression) {
-				output.system.push(buildCavemanSystemPrompt(config.cavemanMode ?? 'full'))
+			const cavemanState = getCavemanState(sessionID)
+			if (cavemanState.enabled) {
+				output.system.push(buildCavemanSystemPrompt(cavemanState.mode))
 			}
 
 			const hookContext = sessionID
@@ -394,27 +431,38 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 		'experimental.chat.messages.transform': async (_input, output) => {
 			if (!config.enableCavemanInputCompression) return
+			const sessionID =
+				typeof (_input as { sessionID?: string }).sessionID === 'string'
+					? (_input as { sessionID?: string }).sessionID
+					: undefined
+			const cavemanState = getCavemanState(sessionID)
+			if (!cavemanState.enabled) return
 
 			for (const message of output.messages) {
 				if (message.info.role !== 'user') continue
 				for (const part of message.parts) {
 					if (part.type === 'text') {
-						part.text = compressForCaveman(part.text, config.cavemanMode)
+						part.text = compressForCaveman(part.text, cavemanState.mode)
 					}
 					if (part.type === 'subtask') {
-						part.prompt = compressForCaveman(part.prompt, config.cavemanMode)
+						part.prompt = compressForCaveman(part.prompt, cavemanState.mode)
 					}
 				}
 			}
 		},
 
 		'experimental.text.complete': async (_input, output) => {
-			if (!config.enableCavemanOutputCompression) return
-			output.text = compressForCaveman(output.text, config.cavemanMode)
+			const cavemanState = getCavemanState(_input.sessionID)
+			if (!cavemanState.enabled) return
+			output.text = compressForCaveman(output.text, cavemanState.mode)
 		},
 
 		'chat.message': async (hookInput, output) => {
 			const prompt = extractUserPrompt(output.parts)
+			const directive = detectCavemanDirective(prompt)
+			if (directive) {
+				updateCavemanState(hookInput.sessionID, directive)
+			}
 			if (config.enableHooks) {
 				const { results } = await runMatchingHooks(
 					'chat.message',

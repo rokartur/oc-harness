@@ -1,5 +1,10 @@
 export type CavemanMode = 'lite' | 'full' | 'ultra'
 
+export interface CavemanDirective {
+	enabled?: boolean
+	mode?: CavemanMode
+}
+
 const PROTECTED_SEGMENT = /```[\s\S]*?```|`[^`\n]+`|https?:\/\/\S+/g
 const SAFE_FILLER = /\b(?:please|just|really|basically|actually|simply|quite|very|kind of|sort of)\b/gi
 const SAFE_OPENERS = /\b(?:sure|certainly|of course|gladly|absolutely)\b[!,.\s]*/gi
@@ -24,25 +29,74 @@ const SAFE_PHRASE_REPLACEMENTS: Array<[RegExp, string]> = [
 
 const MODE_PROMPTS: Record<CavemanMode, string> = {
 	lite: [
-		'Terse like caveman. Technical substance exact. Only fluff die.',
+		'Respond terse like smart caveman. All technical substance stay. Only fluff die.',
+		'Active every response until user says stop caveman or normal mode.',
 		'Drop filler, pleasantries, and hedging. Keep grammar mostly intact.',
-		'Code, commands, paths, and concrete technical details stay unchanged.',
+		'Pattern: [thing] [action] [reason]. [next step].',
+		'Code, commands, paths, commit text, PR text, and exact error strings stay normal and exact.',
+		'If warning, destructive action, or ambiguity needs clarity, be clear first then resume caveman.',
 	].join(' '),
 	full: [
-		'Terse like caveman. Technical substance exact. Only fluff die.',
-		'Drop articles, filler, pleasantries, and hedging.',
-		'Fragments OK. Short synonyms. Code unchanged.',
-		'Pattern: [thing] [action] [reason]. [next step]. Active every response.',
+		'Respond terse like smart caveman. All technical substance stay. Only fluff die.',
+		'Active every response until user says stop caveman or normal mode.',
+		'Drop articles, filler, pleasantries, and hedging. Fragments OK. Short synonyms.',
+		'Pattern: [thing] [action] [reason]. [next step].',
+		'Not: Sure, I would be happy to help. Yes: Bug in auth middleware. Fix below.',
+		'Code, commands, paths, commit text, PR text, and exact error strings stay normal and exact.',
+		'If warning, destructive action, or ambiguity needs clarity, be clear first then resume caveman.',
 	].join(' '),
 	ultra: [
-		'Maximum caveman compression.',
-		'Technical substance exact. Fragments preferred. Drop almost all filler and articles.',
-		'Code, commands, paths, and exact error strings unchanged.',
+		'Maximum caveman compression. Technical substance exact.',
+		'Active every response until user says stop caveman or normal mode.',
+		'Fragments preferred. Drop almost all filler and articles. Prefer shortest exact wording.',
+		'Pattern: [thing] [action] [reason]. [next step].',
+		'Code, commands, paths, commit text, PR text, and exact error strings stay normal and exact.',
+		'If warning, destructive action, or ambiguity needs clarity, be clear first then resume caveman.',
 	].join(' '),
 }
 
 export function buildCavemanSystemPrompt(mode: CavemanMode): string {
-	return `# Caveman Mode (${mode})\n\n${MODE_PROMPTS[mode]}`
+	return [
+		`# Caveman Mode (${mode})`,
+		'',
+		MODE_PROMPTS[mode],
+		'',
+		'Intensity levels: lite = tight full sentences. full = default caveman. ultra = maximum compression.',
+		'Switch with /caveman lite, /caveman full, /caveman ultra. Disable with stop caveman or normal mode.',
+	].join('\n')
+}
+
+export function detectCavemanDirective(input: string): CavemanDirective | null {
+	const text = input.trim().toLowerCase()
+	if (!text) return null
+
+	if (text === '/caveman' || text === '/caveman full') {
+		return { enabled: true, mode: 'full' }
+	}
+	if (text === '/caveman lite') {
+		return { enabled: true, mode: 'lite' }
+	}
+	if (text === '/caveman ultra') {
+		return { enabled: true, mode: 'ultra' }
+	}
+
+	if (
+		/\b(stop|disable|deactivate|turn off)\b.*\bcaveman\b/.test(text) ||
+		/\bcaveman\b.*\b(stop|disable|deactivate|turn off)\b/.test(text) ||
+		/\bnormal mode\b/.test(text)
+	) {
+		return { enabled: false }
+	}
+
+	if (
+		/\b(talk like|use|enable|activate|start)\b.*\bcaveman\b/.test(text) ||
+		/\bcaveman\b.*\b(mode|on|please|again)\b/.test(text) ||
+		/\bless tokens please\b/.test(text)
+	) {
+		return { enabled: true }
+	}
+
+	return null
 }
 
 export function compressForCaveman(input: string, mode: CavemanMode = 'full'): string {
