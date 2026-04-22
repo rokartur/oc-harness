@@ -47,11 +47,34 @@ export interface VerificationRecord {
 	timestamp: number
 }
 
+export interface CompressionTelemetryLayer {
+	baselineChars: number
+	compressedChars: number
+	savedChars: number
+	sampleCount: number
+	lastBaselineChars: number
+	lastCompressedChars: number
+	lastSavedChars: number
+}
+
+export interface SessionCompressionTelemetry {
+	l01Prompt: CompressionTelemetryLayer
+	l02Tool: CompressionTelemetryLayer
+	l03Output: CompressionTelemetryLayer
+	l04Context: CompressionTelemetryLayer
+}
+
 export interface SessionRuntimeSnapshot {
 	phase: ExecutionPhase
 	compiledPrompt: CompiledPrompt | null
 	plan: ExecutionPlan | null
+	nextStep: string
+	currentTarget: string
+	memoryProtocol: string
+	memorySessionPointer: string
+	telemetry: SessionCompressionTelemetry
 	verificationSummary: string[]
 	verificationRecords: VerificationRecord[]
+	startedAt: number
 	updatedAt: number
 }

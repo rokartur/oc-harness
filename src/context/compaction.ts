@@ -33,6 +33,9 @@ export function buildCompactionContext(opts: {
 	runtimeVerification?: string[]
 	includeCavemem?: boolean
 	cavememDataDir?: string
+	searchAlpha?: number
+	embeddingProvider?: string
+	searchDefaultLimit?: number
 }): CompactionContext {
 	const {
 		cwd,
@@ -45,12 +48,18 @@ export function buildCompactionContext(opts: {
 		runtimeVerification,
 		includeCavemem,
 		cavememDataDir,
+		searchAlpha,
+		embeddingProvider,
+		searchDefaultLimit,
 	} = opts
 
 	const memories = lastPrompt
 		? findRelevantProjectMemories(lastPrompt, cwd, 3, {
 				includeCavemem,
 				cavememDataDir,
+				searchAlpha,
+				embeddingProvider,
+				defaultLimit: searchDefaultLimit,
 			})
 		: []
 

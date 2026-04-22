@@ -1,7 +1,9 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin'
+import { join } from 'node:path'
 import { listMemoryFiles } from './memory/manager.js'
 import { getProjectMemoryDir } from './memory/paths.js'
 import { dirExists } from './shared/fs.js'
+import { ensureDir, writeFileAtomic } from './shared/fs.js'
 import { statSync } from 'node:fs'
 import type { CompatibilityReport } from './shared/types.js'
 import type { SessionRuntimeSnapshot } from './runtime/index.js'
@@ -257,11 +259,20 @@ export function createRuntimeStatusTool(
 			const snapshot = getRuntimeSnapshot(ctx.sessionID)
 			if (!snapshot) return 'No hybrid runtime state for this session.'
 
-			const lines: string[] = ['## Hybrid Runtime Status', '', `Phase: ${snapshot.phase}`]
+			const lines: string[] = ['## Hybrid Runtime Status', '', `Phase: ${getDisplayPhase(snapshot)}`]
+			if (snapshot.phase !== getDisplayPhase(snapshot)) lines.push(`Internal phase: ${snapshot.phase}`)
+			if (snapshot.nextStep) lines.push(`Next step: ${snapshot.nextStep}`)
+			if (snapshot.currentTarget) lines.push(`Current target: ${snapshot.currentTarget}`)
+			if (snapshot.memoryProtocol) lines.push(`Memory protocol: ${snapshot.memoryProtocol}`)
+			if (snapshot.memorySessionPointer) lines.push(`Memory session: ${snapshot.memorySessionPointer}`)
+			lines.push(`Elapsed: ${formatElapsed(snapshot.startedAt)}`)
+			lines.push(`Updated: ${new Date(snapshot.updatedAt).toISOString()}`)
+			lines.push('Composition: caveman primitive | cavekit workflow | cavemem memory | flagship runtime')
 			if (snapshot.plan) {
 				lines.push(`Mode: ${snapshot.plan.mode}`)
 				lines.push(`Goal: ${snapshot.plan.goal}`)
-				lines.push(`Summary: ${snapshot.plan.summary}`)
+				lines.push(`Active plan: ${snapshot.plan.summary}`)
+				lines.push(`Task coverage: ${formatTaskCoverage(snapshot.plan)}`)
 				if (snapshot.plan.steps.length > 0) {
 					lines.push('', '### Steps')
 					for (const step of snapshot.plan.steps.slice(0, 5)) {
@@ -270,16 +281,170 @@ export function createRuntimeStatusTool(
 				}
 			}
 
+			const lastVerification = snapshot.verificationRecords.at(-1)
+			if (lastVerification) {
+				lines.push(`Latest validation: ${lastVerification.command} -> ${lastVerification.status}`)
+			}
+
 			if (snapshot.verificationRecords.length > 0) {
 				lines.push('', '### Verification')
 				for (const record of snapshot.verificationRecords.slice(-5)) {
-					lines.push(`- ${record.status}: ${record.command}`)
+					lines.push(`- ${record.status}: ${record.command} (${new Date(record.timestamp).toISOString()})`)
 				}
+			}
+
+			lines.push('', '### L01-L04')
+			lines.push(`- L01 prompt: ${formatTelemetry(snapshot.telemetry.l01Prompt)}`)
+			lines.push(`- L02 tool: ${formatTelemetry(snapshot.telemetry.l02Tool)}`)
+			lines.push(`- L03 output: ${formatTelemetry(snapshot.telemetry.l03Output)}`)
+			lines.push(`- L04 context: ${formatTelemetry(snapshot.telemetry.l04Context)}`)
+			lines.push(`- Total: ${formatTelemetrySummary(snapshot)}`)
+
+			return lines.join('\n')
+		},
+	})
+}
+
+export function createTelemetrySnapshotTool(
+	getRuntimeSnapshot: (sessionID: string) => SessionRuntimeSnapshot | null,
+): ToolDefinition {
+	return tool({
+		description: 'Show L01-L04 telemetry benchmark snapshot for the current session.',
+		args: {},
+		async execute(_args, ctx) {
+			const snapshot = getRuntimeSnapshot(ctx.sessionID)
+			if (!snapshot) return 'No runtime telemetry for this session.'
+
+			const lines: string[] = ['## Telemetry Snapshot', '']
+			lines.push(`Phase: ${getDisplayPhase(snapshot)}`)
+			if (snapshot.phase !== getDisplayPhase(snapshot)) lines.push(`Internal phase: ${snapshot.phase}`)
+			lines.push(`Elapsed: ${formatElapsed(snapshot.startedAt)}`)
+			lines.push(`Session updated: ${new Date(snapshot.updatedAt).toISOString()}`)
+			if (snapshot.plan) lines.push(`Plan mode: ${snapshot.plan.mode}`)
+			if (snapshot.plan) lines.push(`Task coverage: ${formatTaskCoverage(snapshot.plan)}`)
+			if (snapshot.currentTarget) lines.push(`Current target: ${snapshot.currentTarget}`)
+			if (snapshot.memoryProtocol) lines.push(`Memory protocol: ${snapshot.memoryProtocol}`)
+			if (snapshot.memorySessionPointer) lines.push(`Memory: ${snapshot.memorySessionPointer}`)
+			lines.push('')
+			lines.push(`L01 prompt: ${formatTelemetry(snapshot.telemetry.l01Prompt)}`)
+			lines.push(`L02 tool: ${formatTelemetry(snapshot.telemetry.l02Tool)}`)
+			lines.push(`L03 output: ${formatTelemetry(snapshot.telemetry.l03Output)}`)
+			lines.push(`L04 context: ${formatTelemetry(snapshot.telemetry.l04Context)}`)
+			lines.push(`Total: ${formatTelemetrySummary(snapshot)}`)
+			return lines.join('\n')
+		},
+	})
+}
+
+export function createBenchmarkSnapshotTool(
+	getRuntimeSnapshot: (sessionID: string) => SessionRuntimeSnapshot | null,
+): ToolDefinition {
+	return tool({
+		description:
+			'Persist a benchmark snapshot for the current session with L01-L04 telemetry and runtime metadata.',
+		args: {
+			write: z.boolean().optional().describe('Persist snapshot under .openharness/benchmarks (default true)'),
+		},
+		async execute(args, ctx) {
+			const snapshot = getRuntimeSnapshot(ctx.sessionID)
+			if (!snapshot) return 'No runtime benchmark snapshot for this session.'
+
+			const benchmark = {
+				sessionID: ctx.sessionID,
+				phase: getDisplayPhase(snapshot),
+				internalPhase: snapshot.phase,
+				goal: snapshot.plan?.goal ?? snapshot.compiledPrompt?.goal ?? '',
+				mode: snapshot.plan?.mode ?? 'unknown',
+				taskCoverage: snapshot.plan ? formatTaskCoverage(snapshot.plan) : 'n/a',
+				currentTarget: snapshot.currentTarget,
+				memoryProtocol: snapshot.memoryProtocol,
+				memorySessionPointer: snapshot.memorySessionPointer,
+				elapsedMs: Math.max(0, Date.now() - snapshot.startedAt),
+				updatedAt: new Date(snapshot.updatedAt).toISOString(),
+				verification: snapshot.verificationRecords.at(-1) ?? null,
+				telemetry: snapshot.telemetry,
+				total: formatTelemetrySummary(snapshot),
+			}
+
+			const lines = [
+				'## Benchmark Snapshot',
+				'',
+				`Phase: ${benchmark.phase}`,
+				`Goal: ${benchmark.goal || 'n/a'}`,
+				`Plan mode: ${benchmark.mode}`,
+				`Task coverage: ${benchmark.taskCoverage}`,
+				`Current target: ${benchmark.currentTarget || 'n/a'}`,
+				`Memory protocol: ${benchmark.memoryProtocol || 'n/a'}`,
+				`Elapsed: ${formatElapsed(snapshot.startedAt)}`,
+				`L01 prompt: ${formatTelemetry(snapshot.telemetry.l01Prompt)}`,
+				`L02 tool: ${formatTelemetry(snapshot.telemetry.l02Tool)}`,
+				`L03 output: ${formatTelemetry(snapshot.telemetry.l03Output)}`,
+				`L04 context: ${formatTelemetry(snapshot.telemetry.l04Context)}`,
+				`Total: ${formatTelemetrySummary(snapshot)}`,
+			]
+
+			if (args.write !== false) {
+				const outputDir = join(ctx.directory, '.openharness', 'benchmarks')
+				ensureDir(outputDir)
+				const outputPath = join(outputDir, `${ctx.sessionID || 'session'}-${snapshot.updatedAt}.json`)
+				writeFileAtomic(outputPath, `${JSON.stringify(benchmark, null, 2)}\n`)
+				lines.splice(2, 0, `File: ${outputPath}`)
 			}
 
 			return lines.join('\n')
 		},
 	})
+}
+
+function formatTelemetry(layer: SessionRuntimeSnapshot['telemetry']['l01Prompt']): string {
+	if (layer.sampleCount === 0) return 'not observed'
+	const percent = layer.baselineChars > 0 ? ((layer.savedChars / layer.baselineChars) * 100).toFixed(1) : '0.0'
+	return `baseline ${layer.baselineChars} -> ${layer.compressedChars} chars (~${estimateTokens(layer.baselineChars)} -> ~${estimateTokens(layer.compressedChars)} tok), saved ${layer.savedChars} (${percent}%), samples ${layer.sampleCount}, last ${layer.lastBaselineChars} -> ${layer.lastCompressedChars}`
+}
+
+export function formatTelemetrySummary(snapshot: SessionRuntimeSnapshot): string {
+	const layers = [
+		snapshot.telemetry.l01Prompt,
+		snapshot.telemetry.l02Tool,
+		snapshot.telemetry.l03Output,
+		snapshot.telemetry.l04Context,
+	]
+	const baseline = layers.reduce((sum, layer) => sum + layer.baselineChars, 0)
+	const compressed = layers.reduce((sum, layer) => sum + layer.compressedChars, 0)
+	const saved = layers.reduce((sum, layer) => sum + layer.savedChars, 0)
+	const samples = layers.reduce((sum, layer) => sum + layer.sampleCount, 0)
+	if (samples === 0) return 'not observed'
+	const percent = baseline > 0 ? ((saved / baseline) * 100).toFixed(1) : '0.0'
+	return `baseline ${baseline} -> ${compressed} chars (~${estimateTokens(baseline)} -> ~${estimateTokens(compressed)} tok), saved ${saved} (${percent}%), samples ${samples}`
+}
+
+function formatTaskCoverage(snapshot: SessionRuntimeSnapshot['plan']): string {
+	if (!snapshot) return 'n/a'
+	const verify = snapshot.steps.filter(step => step.kind === 'verify').length
+	const edit = snapshot.steps.filter(step => step.kind === 'edit').length
+	const inspect = snapshot.steps.filter(step => step.kind === 'inspect').length
+	return `${snapshot.steps.length} steps (${inspect} inspect, ${edit} edit, ${verify} verify)`
+}
+
+function getDisplayPhase(snapshot: SessionRuntimeSnapshot): string {
+	const lastVerification = snapshot.verificationRecords.at(-1)
+	if (snapshot.phase === 'verify' && lastVerification?.status === 'pass') return 'done'
+	if (snapshot.phase === 'load-context') return 'load context'
+	if (snapshot.phase === 'compile-prompt') return 'compile prompt'
+	if (snapshot.phase === 'run-tests') return 'run/tests'
+	return snapshot.phase
+}
+
+function formatElapsed(startedAt: number): string {
+	const elapsedMs = Math.max(0, Date.now() - startedAt)
+	const totalSeconds = Math.floor(elapsedMs / 1000)
+	const minutes = Math.floor(totalSeconds / 60)
+	const seconds = totalSeconds % 60
+	return `${minutes}m ${String(seconds).padStart(2, '0')}s`
+}
+
+function estimateTokens(chars: number): number {
+	return Math.max(0, Math.ceil(chars / 4))
 }
 
 function formatBytes(bytes: number): string {

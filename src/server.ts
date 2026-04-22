@@ -1,4 +1,5 @@
 import type { Plugin } from '@opencode-ai/plugin'
+import { relative, resolve } from 'node:path'
 import {
 	discoverPluginRoots,
 	discoverPluginDirs,
@@ -20,6 +21,7 @@ import {
 	detectCavemanDirective,
 	type CavemanMode,
 } from './context/caveman.js'
+import { CAVEMAN_FILE_MODES, compressContextFile } from './context/compress-file.js'
 import {
 	SessionStateTracker,
 	buildCompactionContext,
@@ -28,13 +30,19 @@ import {
 } from './context/compaction.js'
 import {
 	createMemoryTools,
+	createCaveMemInspectTools,
 	findRelevantProjectMemories,
+	resolveCaveMemSettings,
 	startCaveMemSession,
 	endCaveMemSession,
 	recordCaveMemUserPrompt,
 	recordCaveMemToolUse,
+	recordCaveMemAssistantStop,
 	recordCaveMemSessionSummary,
 	countCaveMemProjectObservations,
+	listCaveMemSessions,
+	getCaveMemTimeline,
+	getCaveMemObservations,
 } from './memory/index.js'
 import {
 	HookExecutionLog,
@@ -42,14 +50,21 @@ import {
 	createMemoryStatsTool,
 	createHookLogTool,
 	createRuntimeStatusTool,
+	createTelemetrySnapshotTool,
+	createBenchmarkSnapshotTool,
+	formatTelemetrySummary,
 } from './tui.js'
 import { tool as toolFn } from '@opencode-ai/plugin'
 import {
 	compileUserPrompt,
 	buildExecutionPlan,
+	buildCaveKitPlan,
+	checkCaveKitDrift,
 	renderExecutionPlan,
+	resolveCaveKitSpecPath,
 	summarizeExecutionPlan,
 	SessionRuntimeTracker,
+	upsertCaveKitSpec,
 } from './runtime/index.js'
 import { classifyVerification } from './runtime/verifier.js'
 import { applyVerificationToSpec } from './runtime/backprop.js'
@@ -61,10 +76,13 @@ const z = toolFn.schema
 
 export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 	const cavemanMode = normalizeCavemanMode(options?.cavemanMode)
+	const cavememSettings = resolveCaveMemSettings(options as Partial<PluginConfig>)
 	const cavememBinary =
 		typeof options?.cavememBinary === 'string' && options.cavememBinary.trim()
 			? options.cavememBinary.trim()
 			: 'cavemem'
+	const cavekitMutatorMode =
+		options?.cavekitMutatorMode === 'strict-upstream' ? 'strict-upstream' : 'opencode-integrated'
 	const rtkBinary =
 		typeof options?.rtkBinary === 'string' && options.rtkBinary.trim() ? options.rtkBinary.trim() : 'rtk'
 
@@ -88,8 +106,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		cavemanMode,
 		enableCavememBridge: options?.enableCavememBridge !== false,
 		enableCavememMcp: options?.enableCavememMcp !== false,
+		cavekitMutatorMode,
+		cavemem: options?.cavemem as PluginConfig['cavemem'],
 		cavememBinary,
-		cavememDataDir: typeof options?.cavememDataDir === 'string' ? options.cavememDataDir : undefined,
+		cavememDataDir: cavememSettings.dataDir,
 		enableRtk: options?.enableRtk === true,
 		rtkBinary,
 	}
@@ -159,9 +179,22 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		cavemem: {
 			enabled: config.enableCavememBridge !== false,
 			dataDir: config.cavememDataDir,
+			defaultLimit: cavememSettings.searchDefaultLimit,
+			searchAlpha: cavememSettings.searchAlpha,
+			embeddingProvider: cavememSettings.embeddingProvider,
 			resolveMode: sessionID => getCavemanState(sessionID).mode,
+			resolveOptions: sessionID => getCaveMemRuntimeOptions(sessionID),
 		},
 	})
+	const cavememInspectTools =
+		config.enableCavememBridge !== false && (!config.enableCavememMcp || !cavememAvailable)
+			? createCaveMemInspectTools({
+					dataDir: config.cavememDataDir,
+					defaultLimit: cavememSettings.searchDefaultLimit,
+					searchAlpha: cavememSettings.searchAlpha,
+					embeddingProvider: cavememSettings.embeddingProvider,
+				})
+			: {}
 
 	const lastPromptBySession = new Map<string, string>()
 	const MAX_SESSION_CACHE = 50
@@ -182,6 +215,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		sessionRuntimeBySession.set(sessionID, created)
 		trimSessionCache(sessionRuntimeBySession, MAX_SESSION_CACHE)
 		return created
+	}
+
+	function setSessionNextStep(sessionID: string, nextStep: string): void {
+		const normalized = nextStep.trim()
+		getSessionState(sessionID).setNextStep(normalized)
+		getSessionRuntime(sessionID).setNextStep(normalized)
 	}
 
 	function getInvokedSkills(sessionID: string): string[] {
@@ -217,6 +256,25 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		trimSessionCache(cavemanStateBySession, MAX_SESSION_CACHE)
 	}
 
+	function getCaveMemRuntimeOptions(sessionID?: string) {
+		return {
+			dataDir: config.cavememDataDir,
+			mode: cavememSettings.compressionIntensity ?? getCavemanState(sessionID).mode,
+			redactPrivateTags: cavememSettings.redactPrivateTags,
+			excludePathPatterns: cavememSettings.excludePathPatterns,
+			expandForModel: cavememSettings.expandForModel,
+			embeddingProvider: cavememSettings.embeddingProvider,
+			searchAlpha: cavememSettings.searchAlpha,
+			searchDefaultLimit: cavememSettings.searchDefaultLimit,
+		}
+	}
+
+	function describeMemoryProtocol(): string {
+		if (config.enableCavememMcp && cavememAvailable) return 'cavemem mcp primary; local bridge fallback'
+		if (config.enableCavememBridge !== false) return 'cavemem local bridge fallback tools'
+		return 'memory disabled'
+	}
+
 	function recordInvokedSkill(sessionID: string, skillName: string): void {
 		const existing = invokedSkillsBySession.get(sessionID) ?? new Set<string>()
 		existing.add(skillName)
@@ -231,7 +289,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		trimSessionCache(lastPromptBySession, MAX_SESSION_CACHE)
 		const sessionState = getSessionState(sessionID)
 		sessionState.updateGoal(prompt.trim())
-		sessionState.setNextStep('Continue the active task and verify the result.')
+		setSessionNextStep(sessionID, 'Continue the active task and verify the result.')
 	}
 
 	function clearSession(sessionID: string): void {
@@ -322,6 +380,235 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 		tool: {
 			...(config.enableMemory ? memoryTools : {}),
+			...cavememInspectTools,
+			openharness_cavemem_recall: toolFn({
+				description:
+					'Canonical CaveMem recall surface for project memory, sessions, timeline, and observations.',
+				args: {
+					query: z.string().optional().describe('Recall query for task-relevant memory'),
+					mode: z
+						.enum(['search', 'timeline', 'observations', 'sessions'])
+						.optional()
+						.describe('Canonical CaveMem inspect mode'),
+					limit: z.number().optional().describe('Optional result limit'),
+				},
+				async execute(args, ctx) {
+					const mode = args.mode ?? (args.query?.trim() ? 'search' : 'timeline')
+					const limit = args.limit ?? cavememSettings.searchDefaultLimit
+					const lines = ['## CaveMem', '', `Protocol: ${describeMemoryProtocol()}`]
+					if (config.enableCavememMcp && cavememAvailable) {
+						lines.push('Native MCP: available')
+					}
+					if (mode === 'sessions') {
+						const sessions = listCaveMemSessions(
+							ctx.directory,
+							limit,
+							getCaveMemRuntimeOptions(ctx.sessionID),
+						)
+						if (sessions.length === 0) return [...lines, '', 'No CaveMem sessions.'].join('\n')
+						lines.push('', '### Sessions')
+						for (const session of sessions) {
+							lines.push(`- ${session.sessionID} obs=${session.observationCount}`)
+						}
+						return lines.join('\n')
+					}
+					if (mode === 'observations') {
+						const observations = getCaveMemObservations({
+							sessionID: ctx.sessionID,
+							cwd: ctx.directory,
+							maxResults: limit,
+							options: getCaveMemRuntimeOptions(ctx.sessionID),
+						})
+						if (observations.length === 0) return [...lines, '', 'No CaveMem observations.'].join('\n')
+						lines.push('', '### Observations')
+						for (const observation of observations) {
+							lines.push(
+								`- [${observation.event}] ${observation.content.replace(/\s+/g, ' ').slice(0, 160)}`,
+							)
+						}
+						return lines.join('\n')
+					}
+					if (mode === 'timeline') {
+						const timeline = getCaveMemTimeline(
+							ctx.directory,
+							limit,
+							getCaveMemRuntimeOptions(ctx.sessionID),
+						)
+						if (timeline.length === 0) return [...lines, '', 'No CaveMem timeline entries.'].join('\n')
+						lines.push('', '### Timeline')
+						for (const entry of timeline) {
+							lines.push(
+								`- ${entry.sessionID} ${entry.event} ${entry.content.replace(/\s+/g, ' ').slice(0, 160)}`,
+							)
+						}
+						return lines.join('\n')
+					}
+					const query =
+						args.query?.trim() || getLastPrompt(lastPromptBySession, ctx.sessionID) || 'recent work'
+					const memories = findRelevantProjectMemories(query, ctx.directory, limit, {
+						includeCavemem: config.enableCavememBridge !== false,
+						cavememDataDir: config.cavememDataDir,
+						searchAlpha: cavememSettings.searchAlpha,
+						embeddingProvider: cavememSettings.embeddingProvider,
+						defaultLimit: limit,
+					})
+					if (memories.length === 0)
+						return [...lines, '', `Query: ${query}`, '', 'No relevant CaveMem recall.'].join('\n')
+					lines.push('', `Query: ${query}`, '', '### Recall')
+					for (const memory of memories) {
+						lines.push(`- ${memory.title} (${memory.memoryType}) ${memory.description}`)
+					}
+					return lines.join('\n')
+				},
+			}),
+			openharness_cavekit_spec: toolFn({
+				description: 'Create or amend repo-root SPEC.md as the canonical CaveKit workflow artifact.',
+				args: {
+					scope: z.string().optional().describe('Freeform scope or amendment request'),
+					goal: z.string().optional().describe('Optional explicit goal override'),
+					constraints: z.array(z.string()).optional().describe('Optional constraint lines'),
+					interfaces: z.array(z.string()).optional().describe('Optional interface lines'),
+					invariants: z.array(z.string()).optional().describe('Optional invariant lines'),
+					tasks: z.array(z.string()).optional().describe('Optional task descriptions'),
+					bugs: z.array(z.string()).optional().describe('Optional bug notes to append'),
+				},
+				async execute(args, ctx) {
+					const result = upsertCaveKitSpec(ctx.directory, args)
+					return [
+						`Path: ${toDisplayPath(ctx.directory, result.path)}`,
+						`Created: ${result.created ? 'yes' : 'no'}`,
+						`Changed: ${result.changed ? 'yes' : 'no'}`,
+						`Goal: ${result.goal}`,
+						`Task coverage: ${result.taskCoverage}`,
+						`Verify: ${result.validationCommands.join(' ; ') || 'n/a'}`,
+					].join('\n')
+				},
+			}),
+			openharness_cavekit_build: toolFn({
+				description:
+					'Select the next CaveKit task(s), mark active work in SPEC.md, and return the canonical build plan.',
+				args: {
+					selector: z.string().optional().describe('Task selector: ., ~, x, or task ids like T1,T2'),
+					focus: z.string().optional().describe('Optional focus to rank tasks'),
+					limit: z.number().optional().describe('Optional task limit'),
+					markActive: z
+						.boolean()
+						.optional()
+						.describe('Mark selected pending tasks as active (~). Defaults true.'),
+				},
+				async execute(args, ctx) {
+					const result = buildCaveKitPlan(ctx.directory, {
+						selector: args.selector,
+						focus: args.focus,
+						limit: args.limit,
+						markActive: args.markActive !== false,
+					})
+					const runtime = getSessionRuntime(ctx.sessionID)
+					const firstTask = result.selectedTasks[0]
+					if (firstTask) {
+						runtime.setCurrentTarget(firstTask.task)
+						runtime.setNextStep(
+							`Implement ${firstTask.id} and verify with ${result.validationCommands.join(' + ') || 'project checks'}.`,
+						)
+					}
+					return [
+						`Path: ${toDisplayPath(ctx.directory, result.path)}`,
+						`Goal: ${result.goal}`,
+						`Task coverage: ${result.taskCoverage}`,
+						`Changed: ${result.changed ? 'yes' : 'no'}`,
+						`Selected: ${result.selectedTasks.map(task => `${task.id}[${task.status}] ${task.task}`).join(' | ') || 'none'}`,
+						`Verify: ${result.validationCommands.join(' ; ') || 'n/a'}`,
+					].join('\n')
+				},
+			}),
+			openharness_cavekit_check: toolFn({
+				description: 'Perform a deterministic read-only CaveKit drift report against SPEC.md.',
+				args: {
+					focus: z.string().optional().describe('Optional subsystem or file focus'),
+				},
+				async execute(args, ctx) {
+					const result = checkCaveKitDrift(ctx.directory, args.focus)
+					const lines = [
+						'## CaveKit Check',
+						'',
+						`Path: ${toDisplayPath(ctx.directory, result.path)}`,
+						`Goal: ${result.goal}`,
+						`Task coverage: ${result.taskCoverage}`,
+						`Verify: ${result.validationCommands.join(' ; ') || 'n/a'}`,
+						'',
+						'### Findings',
+					]
+					for (const finding of result.findings) {
+						lines.push(`- ${finding.severity.toUpperCase()} ${finding.reference}: ${finding.message}`)
+					}
+					return lines.join('\n')
+				},
+			}),
+			openharness_cavekit_backprop: toolFn({
+				description: 'Backprop the latest failed/flaky verification into SPEC.md using CaveKit semantics.',
+				args: {
+					command: z.string().optional().describe('Optional explicit verification command override'),
+					status: z
+						.enum(['pass', 'fail', 'flaky', 'unknown'])
+						.optional()
+						.describe('Optional explicit verification status override'),
+					summary: z.string().optional().describe('Optional verification summary override'),
+					exitCode: z.number().optional().describe('Optional exit code override'),
+				},
+				async execute(args, ctx) {
+					const runtime = getSessionRuntime(ctx.sessionID).snapshot()
+					const latest = runtime.verificationRecords[runtime.verificationRecords.length - 1]
+					const verification = latest
+						? {
+								...latest,
+								command: args.command ?? latest.command,
+								status: args.status ?? latest.status,
+								summary: args.summary ?? latest.summary,
+								exitCode: args.exitCode ?? latest.exitCode,
+							}
+						: null
+					if (!verification) return 'No verification record available for backprop.'
+					const changed = applyVerificationToSpec(runtime.plan, verification)
+					return [
+						`Path: ${toDisplayPath(ctx.directory, resolveCaveKitSpecPath(ctx.directory))}`,
+						`Verification: ${verification.command} -> ${verification.status}`,
+						`Mutator mode: ${cavekitMutatorMode}`,
+						`Changed: ${changed ? 'yes' : 'no'}`,
+					].join('\n')
+				},
+			}),
+			openharness_caveman_compress_file: toolFn({
+				description:
+					'Compress a repo-local markdown context file in place with Caveman parity rules and create a `.original` backup.',
+				args: {
+					filePath: z
+						.string()
+						.describe('Repo-local markdown file to compress, e.g. `CLAUDE.md` or `docs/guide.md`'),
+					mode: z
+						.enum(CAVEMAN_FILE_MODES)
+						.optional()
+						.describe('Compression mode: lite, full, ultra, wenyan-lite, wenyan, or wenyan-ultra'),
+				},
+				async execute(args, ctx) {
+					const targetPath = resolveRepoLocalPath(ctx.directory, args.filePath)
+					const result = compressContextFile(targetPath, args.mode ?? 'full')
+					const relFile = toDisplayPath(ctx.directory, result.filePath)
+					const relBackup = toDisplayPath(ctx.directory, result.backupPath)
+					const saved = result.originalChars - result.compressedChars
+					const validation = result.validation.valid
+						? 'headings/code/inline/urls/paths/tables preserved'
+						: summarizeCompressionValidation(result.validation)
+					return [
+						`File: ${relFile}`,
+						`Backup: ${relBackup}`,
+						`Mode: ${result.mode}`,
+						`Chars: ${result.originalChars} -> ${result.compressedChars}`,
+						`Saved: ${saved}`,
+						`Changed: ${result.changed ? 'yes' : 'no'}`,
+						`Validation: ${validation}`,
+					].join('\n')
+				},
+			}),
 			...(allSkills.length > 0
 				? {
 						openharness_skill: toolFn({
@@ -356,11 +643,19 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			openharness_memory_stats: createMemoryStatsTool(directory => {
 				if (config.enableCavememBridge === false) return []
 				return [
-					`CaveMem observations: ${countCaveMemProjectObservations(directory, { dataDir: config.cavememDataDir })}`,
+					`CaveMem observations: ${countCaveMemProjectObservations(directory, getCaveMemRuntimeOptions())}`,
 				]
 			}),
 			openharness_hook_log: createHookLogTool(() => hookLog),
 			openharness_runtime_status: createRuntimeStatusTool(sessionID => {
+				if (!sessionID) return null
+				return getSessionRuntime(sessionID).snapshot()
+			}),
+			openharness_telemetry_snapshot: createTelemetrySnapshotTool(sessionID => {
+				if (!sessionID) return null
+				return getSessionRuntime(sessionID).snapshot()
+			}),
+			openharness_benchmark_snapshot: createBenchmarkSnapshotTool(sessionID => {
 				if (!sessionID) return null
 				return getSessionRuntime(sessionID).snapshot()
 			}),
@@ -393,6 +688,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							const command = typeof output.args?.command === 'string' ? output.args.command : ''
 							if (command) {
 								const rewritten = rewriteCommandWithRtk(command, rtkBinary)
+								getSessionRuntime(hookInput.sessionID).noteToolCompression(
+									command.length,
+									rewritten.length,
+								)
 								if (rewritten !== command) {
 									output.args = { ...(output.args ?? {}), command: rewritten }
 								}
@@ -411,10 +710,14 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				})
 			}
 			if (config.enableCavememBridge !== false) {
-				recordCaveMemToolUse(hookInput.sessionID, cwd, hookInput.tool, hookInput.args, toolOutput, {
-					dataDir: config.cavememDataDir,
-					mode: getCavemanState(hookInput.sessionID).mode,
-				})
+				recordCaveMemToolUse(
+					hookInput.sessionID,
+					cwd,
+					hookInput.tool,
+					hookInput.args,
+					toolOutput,
+					getCaveMemRuntimeOptions(hookInput.sessionID),
+				)
 			}
 			const sessionState = getSessionState(hookInput.sessionID)
 			const sessionRuntime = getSessionRuntime(hookInput.sessionID)
@@ -429,9 +732,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						: typeof hookInput.args?.pattern === 'string'
 							? hookInput.args.pattern
 							: ''
-				if (path) sessionState.addArtifact(path)
+				if (path) {
+					sessionState.addArtifact(path)
+					sessionRuntime.setCurrentTarget(path)
+				}
 			}
-			maybeRecordVerificationState(sessionState, hookInput, toolOutput)
+			maybeRecordVerificationState(sessionState, sessionRuntime, hookInput, toolOutput)
 			const verification = classifyVerification({
 				tool: hookInput.tool,
 				args: hookInput.args ?? {},
@@ -439,9 +745,11 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			})
 			if (verification) {
 				sessionRuntime.noteVerification(verification)
-				applyVerificationToSpec(sessionRuntime.snapshot().plan, verification)
+				if (cavekitMutatorMode === 'opencode-integrated') {
+					applyVerificationToSpec(sessionRuntime.snapshot().plan, verification)
+				}
 			}
-			maybeSetNextStep(sessionState, hookInput)
+			maybeSetNextStep(sessionState, sessionRuntime, hookInput)
 		},
 
 		'experimental.session.compacting': async (hookInput, output) => {
@@ -467,6 +775,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					runtimeVerification: runtimeSnapshot.verificationSummary,
 					includeCavemem: config.enableCavememBridge !== false,
 					cavememDataDir: config.cavememDataDir,
+					searchAlpha: cavememSettings.searchAlpha,
+					embeddingProvider: cavememSettings.embeddingProvider,
+					searchDefaultLimit: cavememSettings.searchDefaultLimit,
 				})
 				const formatted = formatCompactionAttachments(ctx)
 				if (formatted) {
@@ -518,6 +829,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					const memories = findRelevantProjectMemories(lastPrompt, cwd, 3, {
 						includeCavemem: config.enableCavememBridge !== false,
 						cavememDataDir: config.cavememDataDir,
+						searchAlpha: cavememSettings.searchAlpha,
+						embeddingProvider: cavememSettings.embeddingProvider,
+						defaultLimit: cavememSettings.searchDefaultLimit,
 					})
 					for (const mem of memories) {
 						allContext.push({
@@ -540,6 +854,11 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							originalChars: ctx.content.length,
 							artifactChars: ctx.content.length,
 						}))
+			if (sessionID && compiledContext.length > 0) {
+				const baselineChars = compiledContext.reduce((sum, ctx) => sum + ctx.originalChars, 0)
+				const compressedChars = compiledContext.reduce((sum, ctx) => sum + ctx.artifactChars, 0)
+				getSessionRuntime(sessionID).noteContextCompression(baselineChars, compressedChars)
+			}
 
 			const section = compiledContext
 				.map(ctx => {
@@ -564,10 +883,16 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				if (message.info.role !== 'user') continue
 				for (const part of message.parts) {
 					if (part.type === 'text') {
+						const original = part.text
 						part.text = compressForCaveman(part.text, cavemanState.mode)
+						if (sessionID)
+							getSessionRuntime(sessionID).notePromptCompression(original.length, part.text.length)
 					}
 					if (part.type === 'subtask') {
+						const original = part.prompt
 						part.prompt = compressForCaveman(part.prompt, cavemanState.mode)
+						if (sessionID)
+							getSessionRuntime(sessionID).notePromptCompression(original.length, part.prompt.length)
 					}
 				}
 			}
@@ -575,8 +900,19 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 		'experimental.text.complete': async (_input, output) => {
 			const cavemanState = getCavemanState(_input.sessionID)
-			if (!cavemanState.enabled) return
-			output.text = compressForCaveman(output.text, cavemanState.mode)
+			const baseline = output.text
+			if (cavemanState.enabled) {
+				output.text = compressForCaveman(output.text, cavemanState.mode)
+			}
+			getSessionRuntime(_input.sessionID).noteOutputCompression(baseline.length, output.text.length)
+			if (config.enableCavememBridge !== false && output.text.trim()) {
+				recordCaveMemAssistantStop(
+					_input.sessionID,
+					cwd,
+					output.text,
+					getCaveMemRuntimeOptions(_input.sessionID),
+				)
+			}
 		},
 
 		'chat.message': async (hookInput, output) => {
@@ -601,10 +937,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			if (prompt) {
 				sessionRuntime.setPhase('compile-prompt')
 				if (config.enableCavememBridge !== false) {
-					recordCaveMemUserPrompt(hookInput.sessionID, cwd, prompt, {
-						dataDir: config.cavememDataDir,
-						mode: getCavemanState(hookInput.sessionID).mode,
-					})
+					recordCaveMemUserPrompt(
+						hookInput.sessionID,
+						cwd,
+						prompt,
+						getCaveMemRuntimeOptions(hookInput.sessionID),
+					)
 				}
 				setLastPrompt(hookInput.sessionID, prompt)
 				const compiledPrompt = compileUserPrompt(prompt)
@@ -618,6 +956,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					? findRelevantProjectMemories(prompt, cwd, 3, {
 							includeCavemem: config.enableCavememBridge !== false,
 							cavememDataDir: config.cavememDataDir,
+							searchAlpha: cavememSettings.searchAlpha,
+							embeddingProvider: cavememSettings.embeddingProvider,
+							defaultLimit: cavememSettings.searchDefaultLimit,
 						})
 					: []
 				const sessionState = getSessionState(hookInput.sessionID)
@@ -629,7 +970,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				})
 				sessionRuntime.setPlan(plan)
 				sessionState.updateGoal(plan.goal)
-				sessionState.setNextStep(plan.steps[0]?.title ?? 'Apply next planned step and verify result.')
+				setSessionNextStep(
+					hookInput.sessionID,
+					plan.steps[0]?.title ?? 'Apply next planned step and verify result.',
+				)
 			} else if (hookInput.messageID) {
 				getSessionState(hookInput.sessionID)
 				getSessionRuntime(hookInput.sessionID)
@@ -640,13 +984,13 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			const type = event.type as string
 			const sessionId = extractSessionId(event)
 			if (config.enableCavememBridge !== false && type === 'session.created' && sessionId) {
-				startCaveMemSession(sessionId, cwd, {
-					dataDir: config.cavememDataDir,
-					mode: getCavemanState(sessionId).mode,
-				})
+				startCaveMemSession(sessionId, cwd, getCaveMemRuntimeOptions(sessionId))
+				getSessionRuntime(sessionId).setMemorySessionPointer(`cavemem://session/${sessionId}`)
 			}
 			if (type === 'session.created' && sessionId) {
-				getSessionRuntime(sessionId).setPhase('load-context')
+				const runtime = getSessionRuntime(sessionId)
+				runtime.setPhase('load-context')
+				runtime.setMemoryProtocol(describeMemoryProtocol())
 			}
 
 			if (config.enableHooks) {
@@ -664,19 +1008,24 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			}
 
 			if (type === 'session.deleted' && sessionId) {
+				const runtimeSnapshot = getSessionRuntime(sessionId).snapshot()
 				if (config.enableCavememBridge !== false) {
 					const summary = buildSessionSummary(
 						getSessionState(sessionId),
 						getLastPrompt(lastPromptBySession, sessionId),
 					)
 					if (summary) {
-						recordCaveMemSessionSummary(sessionId, cwd, summary, {
-							dataDir: config.cavememDataDir,
-							mode: getCavemanState(sessionId).mode,
-						})
+						recordCaveMemSessionSummary(sessionId, cwd, summary, getCaveMemRuntimeOptions(sessionId))
 					}
-					endCaveMemSession(sessionId, { dataDir: config.cavememDataDir })
+					endCaveMemSession(sessionId, getCaveMemRuntimeOptions(sessionId))
 				}
+				await input.client.app.log({
+					body: {
+						service: 'opencode-harness',
+						level: 'info',
+						message: buildRuntimeOpsLogSummary(sessionId, runtimeSnapshot),
+					},
+				})
 				clearSession(sessionId)
 			}
 		},
@@ -786,6 +1135,7 @@ function tryParseJson(input: string): unknown {
 
 function maybeRecordVerificationState(
 	sessionState: SessionStateTracker,
+	sessionRuntime: SessionRuntimeTracker,
 	hookInput: { tool: string; args: any },
 	toolOutput: { title: string; output: string; metadata: any },
 ): void {
@@ -799,18 +1149,25 @@ function maybeRecordVerificationState(
 	const normalized = command.toLowerCase()
 	if (/\b(test|build|typecheck|check|lint)\b/.test(normalized)) {
 		sessionState.addVerifiedState(`Verified: ${truncateStr(command, 100)}`)
+		sessionRuntime.setNextStep('Summarize the verified work or continue with the next change.')
 		sessionState.setNextStep('Summarize the verified work or continue with the next change.')
 	}
 }
 
-function maybeSetNextStep(sessionState: SessionStateTracker, hookInput: { tool: string; args: any }): void {
+function maybeSetNextStep(
+	sessionState: SessionStateTracker,
+	sessionRuntime: SessionRuntimeTracker,
+	hookInput: { tool: string; args: any },
+): void {
 	if (hookInput.tool === 'read' || hookInput.tool === 'glob') {
 		sessionState.setNextStep('Apply the change informed by the latest files and then verify it.')
+		sessionRuntime.setNextStep('Apply the change informed by the latest files and then verify it.')
 		return
 	}
 
 	if (hookInput.tool === 'openharness_skill') {
 		sessionState.setNextStep('Use the loaded compatibility skill while continuing the current task.')
+		sessionRuntime.setNextStep('Use the loaded compatibility skill while continuing the current task.')
 	}
 }
 
@@ -827,7 +1184,60 @@ function buildSessionSummary(sessionState: SessionStateTracker, lastPrompt: stri
 	return lines.join('\n')
 }
 
+function buildRuntimeOpsLogSummary(sessionID: string, snapshot: ReturnType<SessionRuntimeTracker['snapshot']>): string {
+	const parts = [`session=${sessionID}`, `phase=${snapshot.phase}`]
+	if (snapshot.plan) parts.push(`mode=${snapshot.plan.mode}`, `goal=${truncateStr(snapshot.plan.goal, 80)}`)
+	if (snapshot.nextStep) parts.push(`next=${truncateStr(snapshot.nextStep, 80)}`)
+	if (snapshot.currentTarget) parts.push(`target=${truncateStr(snapshot.currentTarget, 80)}`)
+	if (snapshot.memoryProtocol) parts.push(`memproto=${snapshot.memoryProtocol}`)
+	if (snapshot.memorySessionPointer) parts.push(`memory=${snapshot.memorySessionPointer}`)
+	if (snapshot.verificationRecords.length > 0) {
+		const lastVerification = snapshot.verificationRecords[snapshot.verificationRecords.length - 1]
+		parts.push(`verify=${lastVerification.status}:${truncateStr(lastVerification.command, 60)}`)
+	}
+	parts.push(`telemetry=${formatTelemetrySummary(snapshot)}`)
+	return `Runtime ops summary | ${parts.join(' | ')}`
+}
+
 function normalizeCavemanMode(raw: unknown): CavemanMode {
 	if (raw === 'lite' || raw === 'full' || raw === 'ultra') return raw
 	return 'full'
+}
+
+function resolveRepoLocalPath(cwd: string, filePath: string): string {
+	const trimmed = filePath.trim()
+	if (!trimmed) throw new Error('filePath is required')
+	const resolved = resolve(cwd, trimmed)
+	const rel = relative(cwd, resolved)
+	if (rel === '' || (!rel.startsWith('..') && !rel.includes(`..${pathSeparator()}`))) {
+		return resolved
+	}
+	throw new Error(`Refusing to compress file outside repo: ${filePath}`)
+}
+
+function toDisplayPath(cwd: string, filePath: string): string {
+	const rel = relative(cwd, filePath)
+	return rel && !rel.startsWith('..') ? rel : filePath
+}
+
+function summarizeCompressionValidation(validation: {
+	missingHeadings: string[]
+	missingCodeBlocks: string[]
+	missingInlineCode: string[]
+	missingUrls: string[]
+	missingPaths: string[]
+	missingTables: string[]
+}): string {
+	const missing: string[] = []
+	if (validation.missingHeadings.length > 0) missing.push('headings')
+	if (validation.missingCodeBlocks.length > 0) missing.push('code-blocks')
+	if (validation.missingInlineCode.length > 0) missing.push('inline-code')
+	if (validation.missingUrls.length > 0) missing.push('urls')
+	if (validation.missingPaths.length > 0) missing.push('paths')
+	if (validation.missingTables.length > 0) missing.push('tables')
+	return missing.length > 0 ? `missing ${missing.join(', ')}` : 'ok'
+}
+
+function pathSeparator(): string {
+	return process.platform === 'win32' ? '\\' : '/'
 }

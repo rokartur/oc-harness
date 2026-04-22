@@ -45,7 +45,9 @@ export function loadMcpFromPlugin(
 				})
 				continue
 			}
-			result[name] = { ...config } as CompatMcpServer
+			const validated = validateMcpServerConfig(name, config as Record<string, unknown>, diagnostics, pluginName)
+			if (!validated) continue
+			result[name] = validated
 			count++
 		}
 
@@ -63,4 +65,97 @@ export function loadMcpFromPlugin(
 
 function basename(path: string): string {
 	return path.split('/').pop() ?? 'unknown'
+}
+
+function validateMcpServerConfig(
+	name: string,
+	config: Record<string, unknown>,
+	diagnostics: PluginDiagnostic[],
+	pluginName: string,
+): CompatMcpServer | null {
+	if (typeof config['type'] !== 'string' || !config['type'].trim()) {
+		diagnostics.push({
+			level: 'warn',
+			pluginName,
+			message: `Skipping malformed MCP server '${name}': missing type`,
+		})
+		return null
+	}
+
+	const type = config['type'].trim()
+	const command = config['command']
+	const url = config['url']
+	const args = config['args']
+	const headers = config['headers']
+
+	if (command != null && typeof command !== 'string') {
+		diagnostics.push({
+			level: 'warn',
+			pluginName,
+			message: `Skipping malformed MCP server '${name}': command must be string`,
+		})
+		return null
+	}
+	if (url != null && typeof url !== 'string') {
+		diagnostics.push({
+			level: 'warn',
+			pluginName,
+			message: `Skipping malformed MCP server '${name}': url must be string`,
+		})
+		return null
+	}
+	if (args != null && (!Array.isArray(args) || args.some(value => typeof value !== 'string'))) {
+		diagnostics.push({
+			level: 'warn',
+			pluginName,
+			message: `Skipping malformed MCP server '${name}': args must be string[]`,
+		})
+		return null
+	}
+	if (headers != null) {
+		if (typeof headers !== 'object' || headers == null || Array.isArray(headers)) {
+			diagnostics.push({
+				level: 'warn',
+				pluginName,
+				message: `Skipping malformed MCP server '${name}': headers must be object`,
+			})
+			return null
+		}
+		for (const value of Object.values(headers)) {
+			if (typeof value !== 'string') {
+				diagnostics.push({
+					level: 'warn',
+					pluginName,
+					message: `Skipping malformed MCP server '${name}': header values must be strings`,
+				})
+				return null
+			}
+		}
+	}
+	if (type === 'stdio' && (typeof command !== 'string' || !command.trim())) {
+		diagnostics.push({
+			level: 'warn',
+			pluginName,
+			message: `Skipping malformed MCP server '${name}': stdio server missing command`,
+		})
+		return null
+	}
+	if ((type === 'http' || type === 'sse') && (typeof url !== 'string' || !url.trim())) {
+		diagnostics.push({
+			level: 'warn',
+			pluginName,
+			message: `Skipping malformed MCP server '${name}': ${type} server missing url`,
+		})
+		return null
+	}
+
+	return {
+		type,
+		...(typeof command === 'string' ? { command } : {}),
+		...(typeof url === 'string' ? { url } : {}),
+		...(Array.isArray(args) ? { args: [...args] } : {}),
+		...(headers && typeof headers === 'object' && !Array.isArray(headers)
+			? { headers: Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)])) }
+			: {}),
+	}
 }

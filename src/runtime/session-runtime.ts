@@ -1,7 +1,9 @@
 import type {
+	CompressionTelemetryLayer,
 	CompiledPrompt,
 	ExecutionPhase,
 	ExecutionPlan,
+	SessionCompressionTelemetry,
 	SessionRuntimeSnapshot,
 	VerificationRecord,
 } from './types.js'
@@ -10,8 +12,14 @@ export class SessionRuntimeTracker {
 	private phase: ExecutionPhase = 'load-context'
 	private compiledPrompt: CompiledPrompt | null = null
 	private plan: ExecutionPlan | null = null
+	private nextStep = ''
+	private currentTarget = ''
+	private memoryProtocol = ''
+	private memorySessionPointer = ''
+	private telemetry: SessionCompressionTelemetry = createEmptyTelemetry()
 	private verificationSummary: string[] = []
 	private verificationRecords: VerificationRecord[] = []
+	private startedAt = Date.now()
 	private updatedAt = Date.now()
 
 	setPhase(phase: ExecutionPhase): void {
@@ -28,6 +36,50 @@ export class SessionRuntimeTracker {
 	setPlan(plan: ExecutionPlan): void {
 		this.plan = plan
 		this.phase = 'plan'
+		this.nextStep = plan.steps[0]?.title ?? this.nextStep
+		this.currentTarget = plan.steps[0]?.title ?? this.currentTarget
+		this.updatedAt = Date.now()
+	}
+
+	setNextStep(nextStep: string): void {
+		this.nextStep = nextStep.trim()
+		this.updatedAt = Date.now()
+	}
+
+	setCurrentTarget(currentTarget: string): void {
+		const normalized = currentTarget.trim()
+		if (!normalized) return
+		this.currentTarget = normalized
+		this.updatedAt = Date.now()
+	}
+
+	setMemorySessionPointer(pointer: string): void {
+		this.memorySessionPointer = pointer.trim()
+		this.updatedAt = Date.now()
+	}
+
+	setMemoryProtocol(protocol: string): void {
+		this.memoryProtocol = protocol.trim()
+		this.updatedAt = Date.now()
+	}
+
+	notePromptCompression(baselineChars: number, compressedChars: number): void {
+		recordTelemetry(this.telemetry.l01Prompt, baselineChars, compressedChars)
+		this.updatedAt = Date.now()
+	}
+
+	noteToolCompression(baselineChars: number, compressedChars: number): void {
+		recordTelemetry(this.telemetry.l02Tool, baselineChars, compressedChars)
+		this.updatedAt = Date.now()
+	}
+
+	noteOutputCompression(baselineChars: number, compressedChars: number): void {
+		recordTelemetry(this.telemetry.l03Output, baselineChars, compressedChars)
+		this.updatedAt = Date.now()
+	}
+
+	noteContextCompression(baselineChars: number, compressedChars: number): void {
+		recordTelemetry(this.telemetry.l04Context, baselineChars, compressedChars)
 		this.updatedAt = Date.now()
 	}
 
@@ -59,8 +111,14 @@ export class SessionRuntimeTracker {
 			phase: this.phase,
 			compiledPrompt: this.compiledPrompt,
 			plan: this.plan,
+			nextStep: this.nextStep,
+			currentTarget: this.currentTarget,
+			memoryProtocol: this.memoryProtocol,
+			memorySessionPointer: this.memorySessionPointer,
+			telemetry: cloneTelemetry(this.telemetry),
 			verificationSummary: [...this.verificationSummary],
 			verificationRecords: [...this.verificationRecords],
+			startedAt: this.startedAt,
 			updatedAt: this.updatedAt,
 		}
 	}
@@ -69,8 +127,57 @@ export class SessionRuntimeTracker {
 		this.phase = 'load-context'
 		this.compiledPrompt = null
 		this.plan = null
+		this.nextStep = ''
+		this.currentTarget = ''
+		this.memoryProtocol = ''
+		this.memorySessionPointer = ''
+		this.telemetry = createEmptyTelemetry()
 		this.verificationSummary = []
 		this.verificationRecords = []
+		this.startedAt = Date.now()
 		this.updatedAt = Date.now()
+	}
+}
+
+function createEmptyTelemetry(): SessionCompressionTelemetry {
+	return {
+		l01Prompt: createEmptyLayer(),
+		l02Tool: createEmptyLayer(),
+		l03Output: createEmptyLayer(),
+		l04Context: createEmptyLayer(),
+	}
+}
+
+function createEmptyLayer(): CompressionTelemetryLayer {
+	return {
+		baselineChars: 0,
+		compressedChars: 0,
+		savedChars: 0,
+		sampleCount: 0,
+		lastBaselineChars: 0,
+		lastCompressedChars: 0,
+		lastSavedChars: 0,
+	}
+}
+
+function recordTelemetry(layer: CompressionTelemetryLayer, baselineChars: number, compressedChars: number): void {
+	const baseline = Math.max(0, baselineChars)
+	const compressed = Math.max(0, compressedChars)
+	const saved = baseline - compressed
+	layer.baselineChars += baseline
+	layer.compressedChars += compressed
+	layer.savedChars += saved
+	layer.sampleCount += 1
+	layer.lastBaselineChars = baseline
+	layer.lastCompressedChars = compressed
+	layer.lastSavedChars = saved
+}
+
+function cloneTelemetry(telemetry: SessionCompressionTelemetry): SessionCompressionTelemetry {
+	return {
+		l01Prompt: { ...telemetry.l01Prompt },
+		l02Tool: { ...telemetry.l02Tool },
+		l03Output: { ...telemetry.l03Output },
+		l04Context: { ...telemetry.l04Context },
 	}
 }

@@ -2,13 +2,14 @@ import type { ExtraContext } from '../context/instructions.js'
 import type { MemoryHeader } from '../memory/scan.js'
 import type { TaskFocusState } from '../context/compaction.js'
 import type { CompiledPrompt, ExecutionPlan, ExecutionStep } from './types.js'
-
-interface CaveKitTask {
-	id: string
-	status: string
-	task: string
-	cites: string[]
-}
+import {
+	parseCaveKitSpec,
+	selectCaveKitTasks,
+	extractSpecValidationCommands,
+	uniqueStrings,
+	type CaveKitTask,
+	type ParsedCaveKitSpec,
+} from './spec.js'
 
 export function buildExecutionPlan(input: {
 	compiledPrompt: CompiledPrompt
@@ -17,28 +18,48 @@ export function buildExecutionPlan(input: {
 	taskFocus: TaskFocusState
 }): ExecutionPlan {
 	const spec = input.rootContext.find(ctx => ctx.label === 'CaveKit Spec')
-	const tasks = spec ? parseCaveKitTasks(spec.content) : []
+	const parsedSpec = spec ? parseCaveKitSpec(spec.content) : null
+	const tasks = parsedSpec?.tasks ?? []
 	const mode = tasks.length > 0 ? 'spec-driven' : 'ad-hoc'
-	const validationCommands = inferValidationCommands(input.compiledPrompt, input.memories)
+	const validationCommands = inferValidationCommands(input.compiledPrompt, input.memories, parsedSpec)
 	const sourceArtifacts = input.rootContext.map(ctx => ctx.label)
 	const memoryRefs = input.memories.map(memory => memory.title)
 
 	if (mode === 'spec-driven') {
-		const selectedTasks = selectTasks(tasks, input.compiledPrompt)
+		const specDetails = parsedSpec as ParsedCaveKitSpec
+		const selectedTasks = selectCaveKitTasks(tasks, input.compiledPrompt)
+		const plannedSteps: ExecutionStep[] =
+			selectedTasks.length > 0
+				? selectedTasks.map((task, index) => ({
+						id: task.id || `S${index + 1}`,
+						kind: index === selectedTasks.length - 1 ? 'verify' : 'edit',
+						title: task.task,
+						reason:
+							task.status === '~'
+								? 'Resume active CaveKit task.'
+								: 'Advance next CaveKit task from SPEC.md.',
+						citations: uniqueStrings([...task.cites, ...resolveSpecReferences(task.cites, parsedSpec)]),
+						acceptance: buildAcceptance(task, validationCommands, parsedSpec),
+					}))
+				: [
+						{
+							id: 'CHK',
+							kind: 'verify',
+							title: `Verify SPEC drift with ${formatValidationList(validationCommands)}`,
+							reason: 'No unfinished CaveKit tasks remain; check drift and verification status.',
+							citations: uniqueStrings([
+								...specDetails.constraints.slice(0, 2),
+								...specDetails.interfaces.slice(0, 2),
+								...specDetails.invariants.slice(0, 2),
+							]),
+							acceptance: validationCommands.map(command => `Run ${command}`),
+						},
+					]
 		return {
 			mode,
-			goal: spec?.content
-				? extractSpecGoal(spec.content) || input.compiledPrompt.goal
-				: input.compiledPrompt.goal,
-			summary: buildSpecSummary(selectedTasks, validationCommands),
-			steps: selectedTasks.map((task, index) => ({
-				id: task.id || `S${index + 1}`,
-				kind: index === selectedTasks.length - 1 ? 'verify' : 'edit',
-				title: task.task,
-				reason: task.status === '~' ? 'Resume active CaveKit task.' : 'Advance next CaveKit task from SPEC.md.',
-				citations: task.cites,
-				acceptance: buildAcceptance(task, validationCommands),
-			})),
+			goal: specDetails.goal || input.compiledPrompt.goal,
+			summary: buildSpecSummary(selectedTasks, validationCommands, specDetails),
+			steps: plannedSteps,
 			sourceArtifacts,
 			specSource: spec?.source ?? '',
 			memoryRefs,
@@ -100,51 +121,27 @@ export function summarizeExecutionPlan(plan: ExecutionPlan): string {
 	return `${plan.mode}; ${plan.goal}; ${steps}`.trim()
 }
 
-function parseCaveKitTasks(content: string): CaveKitTask[] {
-	const match = content.match(/##\s+§T\s+TASKS\n([\s\S]*?)(?:\n##\s+§|$)/i)
-	if (!match?.[1]) return []
-
-	const rows = match[1]
-		.split('\n')
-		.map(line => line.trim())
-		.filter(line => line && !line.startsWith('id|status|task|cites'))
-
-	const tasks: CaveKitTask[] = []
-	for (const row of rows) {
-		const cells = row.split('|').map(cell => cell.trim())
-		if (cells.length < 4) continue
-		tasks.push({
-			id: cells[0] ?? '',
-			status: cells[1] ?? '.',
-			task: cells[2] ?? '',
-			cites: (cells[3] ?? '-')
-				.split(',')
-				.map(value => value.trim())
-				.filter(value => value && value !== '-'),
-		})
-	}
-	return tasks
-}
-
-function selectTasks(tasks: CaveKitTask[], prompt: CompiledPrompt): CaveKitTask[] {
-	const openTasks = tasks.filter(task => task.status !== 'x')
-	const matched = openTasks.filter(task => prompt.keywords.some(keyword => task.task.toLowerCase().includes(keyword)))
-	const selected = matched.length > 0 ? matched : openTasks
-	return selected.slice(0, 3)
-}
-
-function buildAcceptance(task: CaveKitTask, validationCommands: string[]): string[] {
+function buildAcceptance(task: CaveKitTask, validationCommands: string[], spec: ParsedCaveKitSpec | null): string[] {
 	const acceptance = ['Edit complete and behavior aligned with cited spec references.']
 	if (task.cites.length > 0) acceptance.push(`Respect ${task.cites.join(', ')}.`)
+	const references = spec ? resolveSpecReferences(task.cites, spec) : []
+	for (const reference of references.slice(0, 3)) {
+		acceptance.push(`Preserve ${reference}.`)
+	}
 	if (validationCommands.length > 0) acceptance.push(`Run ${formatValidationList(validationCommands)}.`)
 	return acceptance
 }
 
-function buildSpecSummary(tasks: CaveKitTask[], validationCommands: string[]): string {
+function buildSpecSummary(tasks: CaveKitTask[], validationCommands: string[], spec: ParsedCaveKitSpec | null): string {
 	const taskSummary = tasks.map(task => `${task.id}:${task.task}`).join(' | ')
+	const guardrails = spec
+		? uniqueStrings([...spec.constraints.slice(0, 1), ...spec.invariants.slice(0, 2)]).join(' | ')
+		: ''
 	const verification =
 		validationCommands.length > 0 ? ` Verify with ${formatValidationList(validationCommands)}.` : ''
-	return `SPEC-backed plan. Advance ${taskSummary}.${verification}`.trim()
+	const taskClause = taskSummary ? `Advance ${taskSummary}.` : 'No open CaveKit tasks. Validate current state.'
+	const guardrailClause = guardrails ? ` Preserve ${guardrails}.` : ''
+	return `SPEC-backed plan. ${taskClause}${guardrailClause}${verification}`.trim()
 }
 
 function buildAdHocSteps(
@@ -183,7 +180,7 @@ function buildAdHocSteps(
 	]
 }
 
-function inferValidationCommands(compiledPrompt: CompiledPrompt, memories: MemoryHeader[]): string[] {
+function inferValidationCommandsFallback(compiledPrompt: CompiledPrompt, memories: MemoryHeader[]): string[] {
 	const text = `${compiledPrompt.normalized} ${memories.map(memory => memory.title).join(' ')}`.toLowerCase()
 	if (/\btest\b|spec\b|jest\b|vitest\b/.test(text)) return ['bun test']
 	if (/\blint\b/.test(text)) return ['bun run lint']
@@ -192,9 +189,33 @@ function inferValidationCommands(compiledPrompt: CompiledPrompt, memories: Memor
 	return ['bun test', 'bun run typecheck']
 }
 
-function extractSpecGoal(content: string): string {
-	const match = content.match(/##\s+§G\s+GOAL\n([^\n]+)/i)
-	return match?.[1]?.trim() ?? ''
+function inferValidationCommands(
+	compiledPrompt: CompiledPrompt,
+	memories: MemoryHeader[],
+	spec: ParsedCaveKitSpec | null,
+): string[] {
+	const commands = uniqueStrings([
+		...(spec ? extractSpecValidationCommands(spec) : []),
+		...inferValidationCommandsFallback(compiledPrompt, memories),
+	])
+	return commands.slice(0, 3)
+}
+
+function resolveSpecReferences(citations: string[], spec: ParsedCaveKitSpec | null): string[] {
+	if (!spec) return []
+	const references: string[] = []
+	for (const citation of citations) {
+		if (/^V\d+$/i.test(citation)) {
+			const match = spec.invariants.find(line => line.toLowerCase().startsWith(`${citation.toLowerCase()}:`))
+			if (match) references.push(match)
+			continue
+		}
+		if (/^I[.:]/i.test(citation)) {
+			const match = spec.interfaces.find(line => line.toLowerCase().startsWith(citation.toLowerCase()))
+			if (match) references.push(match)
+		}
+	}
+	return uniqueStrings(references)
 }
 
 function formatValidationList(commands: string[]): string {

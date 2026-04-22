@@ -3,7 +3,7 @@ import { listMemoryFiles, readMemoryFile, writeMemoryFile, deleteMemoryFile } fr
 import { findRelevantMemories, findRelevantProjectMemories } from './search.js'
 import { getMemoryEntrypoint } from './paths.js'
 import { readFileText, fileExists } from '../shared/fs.js'
-import { mirrorMemoryNoteToCaveMem } from './cavemem.js'
+import { mirrorMemoryNoteToCaveMem, type CaveMemOptions } from './cavemem.js'
 import type { CavemanMode } from '../context/caveman.js'
 
 const z = tool.schema
@@ -12,7 +12,11 @@ export interface MemoryToolOptions {
 	cavemem?: {
 		enabled: boolean
 		dataDir?: string
+		defaultLimit?: number
+		searchAlpha?: number
+		embeddingProvider?: string
 		resolveMode?: (sessionID?: string) => CavemanMode
+		resolveOptions?: (sessionID?: string) => CaveMemOptions
 	}
 }
 
@@ -44,14 +48,20 @@ export function createMemoryTools(options: MemoryToolOptions = {}): Record<strin
 			description: 'Search persistent memory files for content relevant to a query (OpenHarness compatible).',
 			args: {
 				query: z.string().describe('Search query to find relevant memory entries'),
+				limit: z.number().optional().describe('Optional result limit'),
 			},
 			async execute(args, ctx) {
+				const cavememOptions = options.cavemem?.resolveOptions?.(ctx.sessionID) ?? {}
+				const limit = args.limit ?? options.cavemem?.defaultLimit ?? 5
 				const results = options.cavemem?.enabled
-					? findRelevantProjectMemories(args.query, ctx.directory, 5, {
+					? findRelevantProjectMemories(args.query, ctx.directory, limit, {
 							includeCavemem: true,
-							cavememDataDir: options.cavemem.dataDir,
+							cavememDataDir: cavememOptions.dataDir ?? options.cavemem.dataDir,
+							searchAlpha: options.cavemem.searchAlpha,
+							embeddingProvider: cavememOptions.embeddingProvider ?? options.cavemem.embeddingProvider,
+							defaultLimit: limit,
 						})
-					: findRelevantMemories(args.query, ctx.directory, 5)
+					: findRelevantMemories(args.query, ctx.directory, limit)
 				if (!results.length) return 'No relevant memories found.'
 
 				const lines = results.map(h => {
@@ -70,9 +80,11 @@ export function createMemoryTools(options: MemoryToolOptions = {}): Record<strin
 			async execute(args, ctx) {
 				const path = writeMemoryFile(ctx.directory, args.title, args.content)
 				if (options.cavemem?.enabled) {
-					const mode = options.cavemem.resolveMode?.(ctx.sessionID) ?? 'full'
+					const resolved = options.cavemem.resolveOptions?.(ctx.sessionID) ?? {}
+					const mode = resolved.mode ?? options.cavemem.resolveMode?.(ctx.sessionID) ?? 'full'
 					mirrorMemoryNoteToCaveMem(ctx.directory, args.title, args.content, {
-						dataDir: options.cavemem.dataDir,
+						...resolved,
+						dataDir: resolved.dataDir ?? options.cavemem.dataDir,
 						mode,
 					})
 					return `Memory written to ${path.split('/').pop()} and mirrored to CaveMem`

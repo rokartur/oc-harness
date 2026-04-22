@@ -4,6 +4,9 @@ import { searchCaveMemProject } from './cavemem.js'
 export interface ProjectMemorySearchOptions {
 	includeCavemem?: boolean
 	cavememDataDir?: string
+	searchAlpha?: number
+	embeddingProvider?: string
+	defaultLimit?: number
 }
 
 export function findRelevantMemories(query: string, cwd: string, maxResults: number = 5): MemoryHeader[] {
@@ -35,29 +38,55 @@ export function findRelevantProjectMemories(
 	maxResults: number = 5,
 	options: ProjectMemorySearchOptions = {},
 ): MemoryHeader[] {
-	const legacy = findRelevantMemories(query, cwd, maxResults * 2).map((header, index) => ({
+	const limit = maxResults > 0 ? maxResults : (options.defaultLimit ?? 5)
+	const alpha = clampAlpha(options.searchAlpha)
+	const legacy = findRelevantMemories(query, cwd, limit * 2).map((header, index, list) => ({
 		header,
-		score: maxResults * 2 - index,
+		score: normalizeRankScore(index, list.length) * (1 - alpha),
 	}))
 	const cavemem = options.includeCavemem
-		? searchCaveMemProject(query, cwd, maxResults * 2, { dataDir: options.cavememDataDir })
+		? searchCaveMemProject(query, cwd, limit * 2, {
+				dataDir: options.cavememDataDir,
+				embeddingProvider: options.embeddingProvider,
+				searchAlpha: options.searchAlpha,
+				searchDefaultLimit: options.defaultLimit,
+			})
 		: []
+	const cavememWeighted = cavemem.map((header, index, list) => ({
+		header,
+		score: normalizeRankScore(index, list.length) * alpha,
+	}))
 
 	const merged = new Map<string, { header: MemoryHeader; score: number }>()
 	for (const entry of legacy) {
 		merged.set(entry.header.path, entry)
 	}
-	for (const entry of cavemem) {
-		const existing = merged.get(entry.path)
-		if (!existing || entry.score > existing.score) {
-			merged.set(entry.path, { header: entry, score: entry.score })
+	for (const entry of cavememWeighted) {
+		const existing = merged.get(entry.header.path)
+		if (!existing) {
+			merged.set(entry.header.path, entry)
+			continue
 		}
+		merged.set(entry.header.path, {
+			header: existing.header.memoryType.startsWith('cavemem:') ? existing.header : entry.header,
+			score: existing.score + entry.score,
+		})
 	}
 
 	return Array.from(merged.values())
 		.sort((a, b) => b.score - a.score || b.header.modifiedAt - a.header.modifiedAt)
-		.slice(0, maxResults)
+		.slice(0, limit)
 		.map(entry => entry.header)
+}
+
+function normalizeRankScore(index: number, length: number): number {
+	if (length <= 0) return 0
+	return (length - index) / length
+}
+
+function clampAlpha(alpha: number | undefined): number {
+	if (typeof alpha !== 'number' || !Number.isFinite(alpha)) return 0.65
+	return Math.min(1, Math.max(0, alpha))
 }
 
 function tokenize(text: string): Set<string> {

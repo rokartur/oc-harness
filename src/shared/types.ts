@@ -122,6 +122,23 @@ export interface PluginConfig {
 	cavemanMode?: 'lite' | 'full' | 'ultra'
 	enableCavememBridge?: boolean
 	enableCavememMcp?: boolean
+	cavekitMutatorMode?: 'strict-upstream' | 'opencode-integrated'
+	cavemem?: {
+		dataDir?: string
+		compression?: {
+			intensity?: 'lite' | 'full' | 'ultra'
+			expandForModel?: boolean
+		}
+		embedding?: {
+			provider?: string
+		}
+		search?: {
+			alpha?: number
+			defaultLimit?: number
+		}
+		redactPrivateTags?: boolean
+		excludePaths?: string[]
+	}
 	cavememBinary?: string
 	cavememDataDir?: string
 	enableRtk?: boolean

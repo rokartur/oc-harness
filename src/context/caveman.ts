@@ -5,7 +5,8 @@ export interface CavemanDirective {
 	mode?: CavemanMode
 }
 
-const PROTECTED_SEGMENT = /```[\s\S]*?```|`[^`\n]+`|https?:\/\/\S+/g
+const PROTECTED_SEGMENT =
+	/```[\s\S]*?```|`[^`\n]+`|https?:\/\/\S+|(?:\.{1,2}\/|\/|(?:[A-Za-z0-9_.-]+\/)+)[A-Za-z0-9_.\-/]+(?:\.[A-Za-z0-9_.-]+)?/g
 const SAFE_FILLER = /\b(?:please|just|really|basically|actually|simply|quite|very|kind of|sort of)\b/gi
 const SAFE_OPENERS = /\b(?:sure|certainly|of course|gladly|absolutely)\b[!,.\s]*/gi
 const SAFE_HELPER_PHRASES =
@@ -62,7 +63,8 @@ export function buildCavemanSystemPrompt(mode: CavemanMode): string {
 		MODE_PROMPTS[mode],
 		'',
 		'Intensity levels: lite = tight full sentences. full = default caveman. ultra = maximum compression.',
-		'Switch with /caveman lite, /caveman full, /caveman ultra. Disable with stop caveman or normal mode.',
+		'Compatibility aliases: wenyan-lite = lite, wenyan = full, wenyan-ultra = ultra.',
+		'Switch with /caveman lite, /caveman full, /caveman ultra, /caveman wenyan-lite, /caveman wenyan, or /caveman wenyan-ultra. Disable with stop caveman or normal mode.',
 	].join('\n')
 }
 
@@ -77,7 +79,16 @@ export function detectCavemanDirective(input: string): CavemanDirective | null {
 	if (text === '/caveman lite') {
 		return { enabled: true, mode: 'lite' }
 	}
+	if (text === '/caveman wenyan-lite') {
+		return { enabled: true, mode: 'lite' }
+	}
 	if (text === '/caveman ultra') {
+		return { enabled: true, mode: 'ultra' }
+	}
+	if (text === '/caveman wenyan') {
+		return { enabled: true, mode: 'full' }
+	}
+	if (text === '/caveman wenyan-ultra') {
 		return { enabled: true, mode: 'ultra' }
 	}
 
@@ -101,6 +112,9 @@ export function detectCavemanDirective(input: string): CavemanDirective | null {
 }
 
 function detectRequestedMode(text: string): CavemanMode | undefined {
+	if (/\bwenyan-ultra\b/.test(text)) return 'ultra'
+	if (/\bwenyan-lite\b/.test(text)) return 'lite'
+	if (/\bwenyan\b/.test(text)) return 'full'
 	if (/\bultra\b/.test(text)) return 'ultra'
 	if (/\blite\b/.test(text)) return 'lite'
 	if (/\bfull\b/.test(text)) return 'full'
@@ -141,6 +155,7 @@ function compressLine(line: string, mode: CavemanMode): string {
 	const match = line.match(/^(\s*(?:[-*+]\s+|\d+\.\s+|#+\s+|>\s+)?)?(.*)$/)
 	const prefix = match?.[1] ?? ''
 	const body = match?.[2] ?? line
+	if (prefix.trimStart().startsWith('#')) return line
 
 	if (!/[A-Za-z]/.test(body)) return line
 

@@ -25,8 +25,8 @@ export function readMemoryFile(path: string): string | null {
 
 export function writeMemoryFile(cwd: string, title: string, content: string): string {
 	if (!title || !title.trim()) title = 'untitled'
-	title = title.slice(0, MAX_MEMORY_TITLE_LENGTH)
-	content = content.slice(0, MAX_MEMORY_CONTENT_SIZE)
+	title = sanitizeMemoryText(title).slice(0, MAX_MEMORY_TITLE_LENGTH)
+	content = sanitizeMemoryText(content).slice(0, MAX_MEMORY_CONTENT_SIZE)
 
 	const dir = getProjectMemoryDir(cwd)
 	ensureDir(dir)
@@ -34,7 +34,8 @@ export function writeMemoryFile(cwd: string, title: string, content: string): st
 	const filePath = join(dir, `${slug}.md`)
 
 	withFileLock(getMemoryLockPath(cwd), () => {
-		const header = `---\nname: ${title.replace(/\n/g, ' ')}\n---\n`
+		const safeTitle = title.replace(/\n/g, ' ').trim() || 'untitled'
+		const header = `---\nname: ${JSON.stringify(safeTitle)}\n---\n`
 		writeFileAtomic(filePath, header + content.trim() + '\n')
 
 		const entrypoint = getMemoryEntrypoint(cwd)
@@ -43,7 +44,7 @@ export function writeMemoryFile(cwd: string, title: string, content: string): st
 			existing = readFileSync(entrypoint, 'utf-8')
 		}
 		if (!existing.includes(slug + '.md')) {
-			existing = existing.trimEnd() + `\n- [${title.replace(/\n/g, ' ')}](${slug}.md)\n`
+			existing = existing.trimEnd() + `\n- [${safeTitle}](${slug}.md)\n`
 			writeFileAtomic(entrypoint, existing)
 		}
 	})
@@ -99,4 +100,11 @@ function sanitizeSlug(title: string): string {
 			.replace(/[^a-z0-9]+/g, '_')
 			.replace(/^_+|_+$/g, '') || 'memory'
 	)
+}
+
+function sanitizeMemoryText(value: string): string {
+	return value
+		.replace(/\u0000/g, ' ')
+		.replace(/[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ')
+		.replace(/\r\n/g, '\n')
 }

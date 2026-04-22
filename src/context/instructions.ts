@@ -1,6 +1,7 @@
+import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import { readFileText, fileExists, dirExists, listDirEntries } from '../shared/fs.js'
-import { MAX_CHARS_PER_FILE } from '../shared/limits.js'
+import { MAX_CHARS_PER_FILE, MAX_CONTEXT_FILE_BYTES } from '../shared/limits.js'
 
 export interface ExtraContext {
 	label: string
@@ -43,11 +44,11 @@ export function discoverExtraContext(cwd: string, options: ExtraContextOptions =
 
 	for (const { enabled, path, label } of sources) {
 		if (!enabled) continue
-		const content = readFileText(path)
+		const content = loadSafeContextFile(path, label)
 		if (content && content.trim()) {
 			contexts.push({
 				label,
-				content: content.trim().slice(0, MAX_CHARS_PER_FILE),
+				content,
 				source: path,
 			})
 		}
@@ -65,11 +66,11 @@ export function discoverClaudeRules(cwd: string): ExtraContext[] {
 	for (const entry of listDirEntries(rulesDir)) {
 		if (!entry.toLowerCase().endsWith('.md')) continue
 		const full = join(rulesDir, entry)
-		const content = readFileText(full)
+		const content = loadSafeContextFile(full, `Rule: ${entry}`)
 		if (content && content.trim()) {
 			contexts.push({
 				label: `Rule: ${entry}`,
-				content: content.trim().slice(0, MAX_CHARS_PER_FILE),
+				content,
 				source: full,
 			})
 		}
@@ -101,15 +102,35 @@ export function discoverRootContext(cwd: string, options: RootContextOptions = {
 
 	for (const { enabled, path, label } of sources) {
 		if (!enabled) continue
-		const content = readFileText(path)
+		const content = loadSafeContextFile(path, label)
 		if (content && content.trim()) {
 			contexts.push({
 				label,
-				content: content.trim().slice(0, MAX_CHARS_PER_FILE),
+				content,
 				source: path,
 			})
 		}
 	}
 
 	return contexts
+}
+
+function loadSafeContextFile(path: string, label: string): string | null {
+	if (!fileExists(path)) return null
+	try {
+		const stat = statSync(path)
+		if (!stat.isFile()) return null
+		if (stat.size > MAX_CONTEXT_FILE_BYTES) {
+			return `[context omitted: ${label} too large (${stat.size} bytes, limit ${MAX_CONTEXT_FILE_BYTES})]`
+		}
+	} catch {
+		return null
+	}
+
+	const content = readFileText(path)
+	if (!content) return null
+	const trimmed = content.trim()
+	if (!trimmed) return null
+	if (trimmed.length <= MAX_CHARS_PER_FILE) return trimmed
+	return `${trimmed.slice(0, MAX_CHARS_PER_FILE)}\n[...truncated context]`
 }
