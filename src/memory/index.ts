@@ -15,6 +15,8 @@ export {
 	listCaveMemSessions,
 	getCaveMemTimeline,
 	getCaveMemObservations,
+	hydrateCaveMemSearchResults,
+	getCaveMemObservationsByIds,
 	reindexCaveMemProject,
 	type CaveMemOptions,
 	type CaveMemObservation,

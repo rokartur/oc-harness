@@ -31,6 +31,7 @@ import {
 import {
 	createMemoryTools,
 	createCaveMemInspectTools,
+	findRelevantMemories,
 	findRelevantProjectMemories,
 	resolveCaveMemSettings,
 	startCaveMemSession,
@@ -43,6 +44,8 @@ import {
 	listCaveMemSessions,
 	getCaveMemTimeline,
 	getCaveMemObservations,
+	hydrateCaveMemSearchResults,
+	searchCaveMemProject,
 } from './memory/index.js'
 import {
 	HookExecutionLog,
@@ -445,18 +448,37 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					}
 					const query =
 						args.query?.trim() || getLastPrompt(lastPromptBySession, ctx.sessionID) || 'recent work'
-					const memories = findRelevantProjectMemories(query, ctx.directory, limit, {
-						includeCavemem: config.enableCavememBridge !== false,
-						cavememDataDir: config.cavememDataDir,
-						searchAlpha: cavememSettings.searchAlpha,
-						embeddingProvider: cavememSettings.embeddingProvider,
-						defaultLimit: limit,
-					})
-					if (memories.length === 0)
+					const cavememIndex =
+						config.enableCavememBridge !== false
+							? searchCaveMemProject(query, ctx.directory, limit, getCaveMemRuntimeOptions(ctx.sessionID))
+							: []
+					const cavememDetails = hydrateCaveMemSearchResults(
+						cavememIndex,
+						ctx.directory,
+						getCaveMemRuntimeOptions(ctx.sessionID),
+						Math.min(limit, 3),
+					)
+					const markdownMemories = findRelevantMemories(query, ctx.directory, Math.min(limit, 3))
+					if (cavememIndex.length === 0 && markdownMemories.length === 0)
 						return [...lines, '', `Query: ${query}`, '', 'No relevant CaveMem recall.'].join('\n')
-					lines.push('', `Query: ${query}`, '', '### Recall')
-					for (const memory of memories) {
-						lines.push(`- ${memory.title} (${memory.memoryType}) ${memory.description}`)
+					lines.push('', `Query: ${query}`)
+					if (cavememIndex.length > 0) {
+						lines.push('', '### MCP Search Index')
+						for (const memory of cavememIndex) {
+							lines.push(`- ${memory.title} (${memory.path}) ${memory.description}`)
+						}
+					}
+					if (cavememDetails.length > 0) {
+						lines.push('', '### Hydrated Observations')
+						for (const memory of cavememDetails) {
+							lines.push(`- ${memory.title} (${memory.memoryType}) ${memory.bodyPreview}`)
+						}
+					}
+					if (markdownMemories.length > 0) {
+						lines.push('', '### Markdown Memory')
+						for (const memory of markdownMemories) {
+							lines.push(`- ${memory.title} (${memory.memoryType}) ${memory.description}`)
+						}
 					}
 					return lines.join('\n')
 				},
@@ -495,6 +517,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						.boolean()
 						.optional()
 						.describe('Mark selected pending tasks as active (~). Defaults true.'),
+					syncLatestVerification: z
+						.boolean()
+						.optional()
+						.describe('Apply the latest session verification to selected tasks. Defaults true.'),
 				},
 				async execute(args, ctx) {
 					const result = buildCaveKitPlan(ctx.directory, {
@@ -511,11 +537,38 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							`Implement ${firstTask.id} and verify with ${result.validationCommands.join(' + ') || 'project checks'}.`,
 						)
 					}
+					const latestVerification = runtime.snapshot().verificationRecords.at(-1) ?? null
+					const verification = args.syncLatestVerification === false ? null : latestVerification
+					const verificationSynced =
+						verification && result.selectedTasks.length > 0
+							? applyVerificationToSpec(
+									{
+										mode: 'spec-driven',
+										goal: result.goal,
+										summary: 'CaveKit build verification sync.',
+										steps: result.selectedTasks.map(task => ({
+											id: task.id,
+											kind: 'edit',
+											title: task.task,
+											reason: 'Sync explicit build verification to SPEC.md.',
+											citations: task.cites,
+											acceptance: result.validationCommands.map(command => `Run ${command}`),
+										})),
+										sourceArtifacts: ['CaveKit Spec'],
+										specSource: result.path,
+										memoryRefs: [],
+										validationCommands: result.validationCommands,
+									},
+									verification,
+								)
+							: false
 					return [
 						`Path: ${toDisplayPath(ctx.directory, result.path)}`,
 						`Goal: ${result.goal}`,
 						`Task coverage: ${result.taskCoverage}`,
 						`Changed: ${result.changed ? 'yes' : 'no'}`,
+						`Verification sync: ${verification ? `${verification.command} -> ${verification.status}` : 'none'}`,
+						`Backprop applied: ${verificationSynced ? 'yes' : 'no'}`,
 						`Selected: ${result.selectedTasks.map(task => `${task.id}[${task.status}] ${task.task}`).join(' | ') || 'none'}`,
 						`Verify: ${result.validationCommands.join(' ; ') || 'n/a'}`,
 					].join('\n')

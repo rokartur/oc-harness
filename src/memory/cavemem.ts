@@ -112,6 +112,11 @@ export interface CaveMemReindexResult {
 	updated: number
 }
 
+interface ParsedCaveMemUri {
+	sessionID: string
+	observationID: number
+}
+
 interface CaveMemSearchRow {
 	id: number
 	session_id: string
@@ -428,6 +433,59 @@ export function getCaveMemObservations(input: {
 				 LIMIT ?`,
 			)
 			.all(...params) as Array<Record<string, unknown>>
+		return rows.map(mapObservationRow)
+	})
+}
+
+export function hydrateCaveMemSearchResults(
+	results: Array<MemoryHeader & { score: number }>,
+	cwd: string,
+	options: CaveMemOptions = {},
+	maxResults: number = 3,
+): Array<MemoryHeader & { score: number }> {
+	const selected = results.slice(0, Math.max(0, maxResults))
+	const parsed = selected.map(result => ({ result, uri: parseCaveMemUri(result.path) })).filter(entry => entry.uri)
+	const ids = uniqueNumbers(parsed.map(entry => entry.uri!.observationID))
+	if (ids.length === 0) return results
+
+	const observations = getCaveMemObservationsByIds({ cwd, ids, options })
+	if (observations.length === 0) return results
+	const byId = new Map(observations.map(observation => [observation.id, observation]))
+
+	return results.map(result => {
+		const uri = parseCaveMemUri(result.path)
+		if (!uri) return result
+		const observation = byId.get(uri.observationID)
+		if (!observation) return result
+		const content = observation.content.replace(/\s+/g, ' ').trim()
+		return {
+			...result,
+			description: content.slice(0, 200) || result.description,
+			bodyPreview: content.slice(0, 500) || result.bodyPreview,
+			modifiedAt: observation.timestamp || result.modifiedAt,
+		}
+	})
+}
+
+export function getCaveMemObservationsByIds(input: {
+	ids: number[]
+	cwd: string
+	options?: CaveMemOptions
+}): CaveMemObservation[] {
+	const options = input.options ?? {}
+	const ids = uniqueNumbers(input.ids)
+	if (ids.length === 0) return []
+	return withCaveMemDb(options, db => {
+		const placeholders = ids.map(() => '?').join(',')
+		const rows = db
+			.prepare(
+				`SELECT o.id, o.session_id, o.kind, o.content, o.intensity, o.ts, o.metadata
+				 FROM observations o
+				 JOIN sessions s ON s.id = o.session_id
+				 WHERE s.cwd = ? AND o.id IN (${placeholders})
+				 ORDER BY o.ts DESC`,
+			)
+			.all(resolve(input.cwd), ...ids) as Array<Record<string, unknown>>
 		return rows.map(mapObservationRow)
 	})
 }
@@ -926,4 +984,23 @@ function readEmbeddingVector(metadata: Record<string, unknown>, provider: string
 function normalizeRankScore(index: number, length: number): number {
 	if (length <= 0) return 0
 	return (length - index) / length
+}
+
+function parseCaveMemUri(uri: string): ParsedCaveMemUri | null {
+	const match = uri.match(/^cavemem:\/\/([^/]+)\/(\d+)$/)
+	if (!match) return null
+	const observationID = Number.parseInt(match[2] ?? '', 10)
+	if (!Number.isFinite(observationID)) return null
+	return { sessionID: match[1] ?? '', observationID }
+}
+
+function uniqueNumbers(values: number[]): number[] {
+	const seen = new Set<number>()
+	const ordered: number[] = []
+	for (const value of values) {
+		if (!Number.isFinite(value) || seen.has(value)) continue
+		seen.add(value)
+		ordered.push(value)
+	}
+	return ordered
 }

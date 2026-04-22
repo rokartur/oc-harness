@@ -1,11 +1,12 @@
 import { scanMemoryFiles, type MemoryHeader } from './scan.js'
-import { searchCaveMemProject } from './cavemem.js'
+import { hydrateCaveMemSearchResults, searchCaveMemProject } from './cavemem.js'
 
 export interface ProjectMemorySearchOptions {
 	includeCavemem?: boolean
 	cavememDataDir?: string
 	searchAlpha?: number
 	embeddingProvider?: string
+	preferMcpShape?: boolean
 	defaultLimit?: number
 }
 
@@ -44,7 +45,7 @@ export function findRelevantProjectMemories(
 		header,
 		score: normalizeRankScore(index, list.length) * (1 - alpha),
 	}))
-	const cavemem = options.includeCavemem
+	const cavememIndex = options.includeCavemem
 		? searchCaveMemProject(query, cwd, limit * 2, {
 				dataDir: options.cavememDataDir,
 				embeddingProvider: options.embeddingProvider,
@@ -52,6 +53,20 @@ export function findRelevantProjectMemories(
 				searchDefaultLimit: options.defaultLimit,
 			})
 		: []
+	const cavemem =
+		options.includeCavemem && options.preferMcpShape !== false
+			? hydrateCaveMemSearchResults(
+					cavememIndex,
+					cwd,
+					{
+						dataDir: options.cavememDataDir,
+						embeddingProvider: options.embeddingProvider,
+						searchAlpha: options.searchAlpha,
+						searchDefaultLimit: options.defaultLimit,
+					},
+					limit,
+				)
+			: cavememIndex
 	const cavememWeighted = cavemem.map((header, index, list) => ({
 		header,
 		score: normalizeRankScore(index, list.length) * alpha,
