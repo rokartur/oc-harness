@@ -60,6 +60,7 @@ const BUILTIN_COMMANDS: Record<string, { template: string; description: string }
 		template: [
 			'Recall task-relevant memory before acting.',
 			'Start by calling `openharness_cavemem_recall` with `$ARGUMENTS` as query when available.',
+			'When native `cavemem` MCP is available, use its compact search index first and hydrate only the best hits.',
 			'Use both OpenHarness memory files and CaveMem-backed session memory for the current project.',
 			'Summarize only the observations that change planning, editing, or verification decisions.',
 			'Treat `$ARGUMENTS` as the recall query or focus area.',
@@ -100,7 +101,7 @@ const BUILTIN_COMMANDS: Record<string, { template: string; description: string }
 		template: [
 			'Use CaveMem as the canonical project memory surface for this task.',
 			'Start by calling `openharness_cavemem_recall` when available.',
-			'Prefer native `cavemem` MCP when available. Otherwise use the fallback inspect/search tools: `cavemem_search`, `cavemem_timeline`, `cavemem_get_observations`, `cavemem_list_sessions`, and `cavemem_reindex`.',
+			'Prefer native `cavemem` MCP when available and follow search -> hydrate details. Otherwise use the fallback inspect/search tools: `cavemem_search`, `cavemem_timeline`, `cavemem_get_observations`, `cavemem_list_sessions`, and `cavemem_reindex`.',
 			'Treat `$ARGUMENTS` as a recall query by default. If the user asks for sessions, timeline, observations, or reindex, use the matching CaveMem surface.',
 			'Return only the memory that changes planning, editing, verification, or backprop decisions.',
 			'Keep the response read-focused unless the user explicitly asks to persist new memory.',
@@ -134,6 +135,7 @@ const BUILTIN_COMMANDS: Record<string, { template: string; description: string }
 			'Start by calling `openharness_cavekit_build` when available.',
 			'Read repo-root `SPEC.md` first.',
 			'Select the next unfinished or in-progress task from `§T TASKS`, implement the minimal correct diff, and keep work aligned with cited interfaces and invariants.',
+			'Run inferred verification commands directly when available, then sync verification status back into `SPEC.md`.',
 			'Update task state as work progresses: `.` -> `~` -> `x` only when the task is actually complete and verified.',
 			'If validation fails, backprop the failure into `§B BUGS` and add the missing guardrail in `§V INVARIANTS` before continuing.',
 			'Treat `$ARGUMENTS` as an optional task selector, scope, or constraint override.',
@@ -145,6 +147,7 @@ const BUILTIN_COMMANDS: Record<string, { template: string; description: string }
 			'Start by calling `openharness_cavekit_build` when available.',
 			'Read repo-root `SPEC.md` first.',
 			'Select the next unfinished or in-progress task from `§T TASKS`, implement the minimal correct diff, and keep work aligned with cited interfaces and invariants.',
+			'Run inferred verification commands directly when available, then sync verification status back into `SPEC.md`.',
 			'Update task state as work progresses: `.` -> `~` -> `x` only when the task is actually complete and verified.',
 			'If validation fails, backprop the failure into `§B BUGS` and add the missing guardrail in `§V INVARIANTS` before continuing.',
 			'Treat `$ARGUMENTS` as an optional task selector, scope, or constraint override.',

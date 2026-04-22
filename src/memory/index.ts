@@ -25,6 +25,14 @@ export {
 } from './cavemem.js'
 export { resolveCaveMemSettings, type ResolvedCaveMemSettings } from './settings.js'
 export { createCaveMemInspectTools, type CaveMemInspectToolOptions } from './cavemem-tools.js'
+export {
+	searchCaveMemProjectViaMcp,
+	getCaveMemTimelineViaMcp,
+	getCaveMemObservationsByIdsViaMcp,
+	hydrateCaveMemSearchResultsViaMcp,
+	listCaveMemSessionsViaMcp,
+	reindexCaveMemProjectViaMcp,
+} from './mcp-client.js'
 export { getProjectMemoryDir, getMemoryEntrypoint } from './paths.js'
 export {
 	createMemoryTools,

@@ -1,5 +1,6 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin'
 import { listMemoryFiles, readMemoryFile, writeMemoryFile, deleteMemoryFile } from './manager.js'
+import type { MemoryHeader } from './scan.js'
 import { findRelevantMemories, findRelevantProjectMemories } from './search.js'
 import { getMemoryEntrypoint } from './paths.js'
 import { readFileText, fileExists } from '../shared/fs.js'
@@ -18,6 +19,12 @@ export interface MemoryToolOptions {
 		resolveMode?: (sessionID?: string) => CavemanMode
 		resolveOptions?: (sessionID?: string) => CaveMemOptions
 	}
+	searchProjectMemories?: (input: {
+		query: string
+		directory: string
+		sessionID?: string
+		limit: number
+	}) => Promise<MemoryHeader[]>
 }
 
 export function createMemoryTools(options: MemoryToolOptions = {}): Record<string, ToolDefinition> {
@@ -53,15 +60,23 @@ export function createMemoryTools(options: MemoryToolOptions = {}): Record<strin
 			async execute(args, ctx) {
 				const cavememOptions = options.cavemem?.resolveOptions?.(ctx.sessionID) ?? {}
 				const limit = args.limit ?? options.cavemem?.defaultLimit ?? 5
-				const results = options.cavemem?.enabled
-					? findRelevantProjectMemories(args.query, ctx.directory, limit, {
-							includeCavemem: true,
-							cavememDataDir: cavememOptions.dataDir ?? options.cavemem.dataDir,
-							searchAlpha: options.cavemem.searchAlpha,
-							embeddingProvider: cavememOptions.embeddingProvider ?? options.cavemem.embeddingProvider,
-							defaultLimit: limit,
+				const results = options.searchProjectMemories
+					? await options.searchProjectMemories({
+							query: args.query,
+							directory: ctx.directory,
+							sessionID: ctx.sessionID,
+							limit,
 						})
-					: findRelevantMemories(args.query, ctx.directory, limit)
+					: options.cavemem?.enabled
+						? findRelevantProjectMemories(args.query, ctx.directory, limit, {
+								includeCavemem: true,
+								cavememDataDir: cavememOptions.dataDir ?? options.cavemem.dataDir,
+								searchAlpha: options.cavemem.searchAlpha,
+								embeddingProvider:
+									cavememOptions.embeddingProvider ?? options.cavemem.embeddingProvider,
+								defaultLimit: limit,
+							})
+						: findRelevantMemories(args.query, ctx.directory, limit)
 				if (!results.length) return 'No relevant memories found.'
 
 				const lines = results.map(h => {

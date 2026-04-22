@@ -12,14 +12,33 @@ export function classifyVerification(input: {
 
 	const exitCode = typeof input.output.metadata?.exitCode === 'number' ? input.output.metadata.exitCode : null
 	const body = typeof input.output.output === 'string' ? input.output.output : ''
+	return createVerificationRecord(command, body, exitCode)
+}
+
+export function createVerificationRecord(
+	command: string,
+	body: string,
+	exitCode: number | null,
+	timestamp: number = Date.now(),
+): VerificationRecord {
 	const status = classifyStatus(exitCode, body)
 	return {
 		command,
 		status,
 		summary: summarize(command, status, body, exitCode),
 		exitCode,
-		timestamp: Date.now(),
+		timestamp,
 	}
+}
+
+export function combineVerificationRecords(records: VerificationRecord[]): VerificationRecord | null {
+	if (records.length === 0) return null
+	const status = summarizeStatuses(records.map(record => record.status))
+	const exitCode = status === 'pass' ? 0 : (records.find(record => record.exitCode != null)?.exitCode ?? null)
+	const command = records.map(record => record.command).join(' ; ')
+	const body = records.map(record => record.summary).join(' | ')
+	const timestamp = records[records.length - 1]?.timestamp ?? Date.now()
+	return createVerificationRecord(command, body, exitCode, timestamp)
 }
 
 function classifyStatus(exitCode: number | null, body: string): VerificationStatus {
@@ -36,4 +55,11 @@ function summarize(command: string, status: VerificationStatus, body: string, ex
 	const head = body.replace(/\s+/g, ' ').trim().slice(0, 160)
 	const suffix = typeof exitCode === 'number' ? ` exit=${exitCode}` : ''
 	return `${command} [${status}${suffix ? ` ${suffix.trim()}` : ''}]${head ? ` ${head}` : ''}`
+}
+
+function summarizeStatuses(statuses: VerificationStatus[]): VerificationStatus {
+	if (statuses.includes('fail')) return 'fail'
+	if (statuses.includes('flaky')) return 'flaky'
+	if (statuses.includes('unknown')) return 'unknown'
+	return 'pass'
 }

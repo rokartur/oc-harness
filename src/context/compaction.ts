@@ -28,6 +28,7 @@ export function buildCompactionContext(opts: {
 	plugins: LoadedCompatPlugin[]
 	invokedSkills: string[]
 	sessionState: SessionStateTracker
+	relevantMemories?: MemoryHeader[]
 	executionPlanSummary?: string
 	executionPhase?: string
 	runtimeVerification?: string[]
@@ -43,6 +44,7 @@ export function buildCompactionContext(opts: {
 		plugins,
 		invokedSkills,
 		sessionState,
+		relevantMemories,
 		executionPlanSummary,
 		executionPhase,
 		runtimeVerification,
@@ -53,15 +55,17 @@ export function buildCompactionContext(opts: {
 		searchDefaultLimit,
 	} = opts
 
-	const memories = lastPrompt
-		? findRelevantProjectMemories(lastPrompt, cwd, 3, {
-				includeCavemem,
-				cavememDataDir,
-				searchAlpha,
-				embeddingProvider,
-				defaultLimit: searchDefaultLimit,
-			})
-		: []
+	const memories =
+		relevantMemories ??
+		(lastPrompt
+			? findRelevantProjectMemories(lastPrompt, cwd, 3, {
+					includeCavemem,
+					cavememDataDir,
+					searchAlpha,
+					embeddingProvider,
+					defaultLimit: searchDefaultLimit,
+				})
+			: [])
 
 	return {
 		taskFocus: sessionState.getTaskFocus(),
