@@ -90,6 +90,9 @@ export interface SessionRuntimeSnapshot {
 	currentTarget: string
 	memoryProtocol: string
 	memorySessionPointer: string
+	doctorSummary: string
+	qualitySummary: string
+	recoverySummary: string
 	telemetry: SessionCompressionTelemetry
 	verificationSummary: string[]
 	verificationRecords: VerificationRecord[]

@@ -1,7 +1,7 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import { spawnSync } from 'node:child_process'
 import { rmSync } from 'node:fs'
-import { relative, resolve } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import {
 	discoverPluginRoots,
 	discoverPluginDirs,
@@ -34,7 +34,6 @@ import {
 	createMemoryTools,
 	createCaveMemInspectTools,
 	findRelevantMemories,
-	findRelevantProjectMemories,
 	resolveCaveMemSettings,
 	startCaveMemSession,
 	endCaveMemSession,
@@ -73,20 +72,102 @@ import {
 	buildExecutionPlan,
 	buildCaveKitPlan,
 	checkCaveKitDrift,
+	DeltaReadManager,
+	formatArchivedOutput,
+	GraphLiteService,
+	PendingTodosTracker,
+	ProgressiveCheckpointManager,
 	renderExecutionPlan,
 	resolveCaveKitSpecPath,
+	SessionPrimer,
+	SessionRetryManager,
 	summarizeExecutionPlan,
+	SnapshotManager,
 	SessionRuntimeTracker,
+	ToolArchiveManager,
 	upsertCaveKitSpec,
+	runDoctorProbes,
+	renderDoctorReport,
+	renderDoctorSummary,
+	checkBinary,
+	renderGroupedGrepOutput,
+	SessionRecoveryManager,
+	QualityScorer,
 } from './runtime/index.js'
+import type { DoctorProbeContext } from './runtime/index.js'
 import { classifyVerification, combineVerificationRecords, createVerificationRecord } from './runtime/verifier.js'
 import { applyVerificationToSpec } from './runtime/backprop.js'
-import type { PluginConfig, CompatHook, LoadedCompatPlugin } from './shared/types.js'
+import type { PluginConfig, CompatHook } from './shared/types.js'
 import { injectCavememMcp, isCavememAvailable } from './shared/cavemem.js'
 import { isRtkAvailable, resolveRtkCommandCompression } from './shared/rtk.js'
-import { writeFileAtomic } from './shared/fs.js'
+import { fileExists, writeFileAtomic } from './shared/fs.js'
 
 const z = toolFn.schema
+
+// --- host-side search fast-path utilities ---
+
+function hostGrepFastPath(
+	cwd: string,
+	pattern: string,
+	includePattern?: string,
+	maxResults: number = 200,
+): string | null {
+	const rgAvailable = checkBinary('rg')
+	if (!rgAvailable) return null
+	try {
+		const args = ['--line-number', '--max-count', String(maxResults)]
+		if (includePattern) {
+			args.push('--glob', includePattern)
+		}
+		args.push(pattern, cwd)
+		const result = spawnSync('rg', args, {
+			cwd,
+			encoding: 'utf-8',
+			stdio: ['ignore', 'pipe', 'ignore'],
+			timeout: 10000,
+		})
+		if (result.status !== 0 && result.status !== 1) return null
+		const output = (result.stdout ?? '').trim()
+		if (!output) return ''
+		return output
+	} catch {
+		return null
+	}
+}
+
+function hostGlobFastPath(cwd: string, pattern: string, maxResults: number = 500): string | null {
+	// Use `find` or `rg --files` for fast glob-like resolution
+	// Only handle simple patterns that rg --files can serve cheaply
+	const rgAvailable = checkBinary('rg')
+	if (!rgAvailable) return null
+	try {
+		const args: string[] = ['--files']
+		// Simple extension filtering from glob pattern
+		const extMatch = pattern.match(/\*\.([a-zA-Z0-9]+)$/)
+		if (extMatch) {
+			args.push('--glob', `*.${extMatch[1]}`)
+		} else if (pattern === '**/*' || pattern === '*' || pattern === '.') {
+			// all files
+		} else {
+			// For more complex patterns, let the builtin handle it
+			return null
+		}
+		args.push(cwd)
+		const result = spawnSync('rg', args, {
+			cwd,
+			encoding: 'utf-8',
+			stdio: ['ignore', 'pipe', 'ignore'],
+			timeout: 10000,
+		})
+		if (result.status !== 0 && result.status !== 1) return null
+		const output = (result.stdout ?? '').trim()
+		if (!output) return ''
+		const lines = output.split('\n').filter(Boolean).slice(0, maxResults)
+		return lines.join('\n')
+	} catch {
+		return null
+	}
+}
 
 export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 	const cavemanMode = normalizeCavemanMode(options?.cavemanMode)
@@ -108,6 +189,31 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		enableHooks: options?.enableHooks !== false,
 		enableMemory: options?.enableMemory !== false,
 		enableCompaction: options?.enableCompaction !== false,
+		enableDeltaRead: options?.enableDeltaRead === true,
+		deltaReadMaxCachePerSession:
+			typeof options?.deltaReadMaxCachePerSession === 'number' ? options.deltaReadMaxCachePerSession : undefined,
+		deltaReadMaxDiffChars:
+			typeof options?.deltaReadMaxDiffChars === 'number' ? options.deltaReadMaxDiffChars : undefined,
+		deltaReadExcludePatterns: options?.deltaReadExcludePatterns as string[] | undefined,
+		enableToolArchive: options?.enableToolArchive === true,
+		toolArchiveThresholdChars:
+			typeof options?.toolArchiveThresholdChars === 'number' ? options.toolArchiveThresholdChars : undefined,
+		toolArchiveExemptTools: options?.toolArchiveExemptTools as string[] | undefined,
+		enableSessionRetry: options?.enableSessionRetry === true,
+		sessionRetryBackoffMs:
+			typeof options?.sessionRetryBackoffMs === 'number' ? options.sessionRetryBackoffMs : undefined,
+		enableSessionRecovery: options?.enableSessionRecovery === true,
+		enableSessionPrimer: options?.enableSessionPrimer === true,
+		enableProgressiveCheckpoints: options?.enableProgressiveCheckpoints === true,
+		enablePersistedCheckpoints: options?.enablePersistedCheckpoints === true,
+		enableQualityScorer: options?.enableQualityScorer === true,
+		enableHostGrep: options?.enableHostGrep !== false,
+		enableHostGlob: options?.enableHostGlob !== false,
+		enableDoctor: options?.enableDoctor !== false,
+		enableSnapshots: options?.enableSnapshots === true,
+		enablePendingTodoReminders: options?.enablePendingTodoReminders === true,
+		enableGraphLite: options?.enableGraphLite === true,
+		graphLiteMaxFiles: typeof options?.graphLiteMaxFiles === 'number' ? options.graphLiteMaxFiles : undefined,
 		enableClaudeRulesCompat: options?.enableClaudeRulesCompat !== false,
 		enableClaudeMdContext: options?.enableClaudeMdContext !== false,
 		enableAgentsMdContext: options?.enableAgentsMdContext !== false,
@@ -189,7 +295,37 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 	const cavemanStateBySession = new Map<string, { enabled: boolean; mode: CavemanMode }>()
 	const persistentHookContextBySession = new Map<string, string[]>()
 	const promptHookContextBySession = new Map<string, string[]>()
+	const sessionPrimerBySession = new Map<string, ReturnType<SessionPrimer['buildSnapshot']>>()
 	const hookLog = new HookExecutionLog()
+	const runtimeDataDir = join(cwd, '.openharness', 'runtime')
+	const archiveManager = new ToolArchiveManager(join(runtimeDataDir, 'tool-archive'), {
+		enabled: config.enableToolArchive,
+		thresholdChars: config.toolArchiveThresholdChars,
+		exemptTools: config.toolArchiveExemptTools,
+	})
+	const deltaReadManager = new DeltaReadManager({
+		enabled: config.enableDeltaRead,
+		maxCachePerSession: config.deltaReadMaxCachePerSession,
+		maxDiffChars: config.deltaReadMaxDiffChars,
+		excludePatterns: config.deltaReadExcludePatterns,
+	})
+	const sessionRetryManager = new SessionRetryManager(input.client as any, cwd, {
+		enabled: config.enableSessionRetry,
+		backoffMs: config.sessionRetryBackoffMs,
+	})
+	const sessionPrimer = new SessionPrimer({ enabled: config.enableSessionPrimer })
+	const checkpointManager = new ProgressiveCheckpointManager(
+		config.enableProgressiveCheckpoints === true,
+		config.enablePersistedCheckpoints === true ? join(runtimeDataDir, 'checkpoints') : undefined,
+	)
+	const snapshotManager = new SnapshotManager(join(runtimeDataDir, 'snapshots'))
+	const pendingTodos = new PendingTodosTracker()
+	const graphLite = new GraphLiteService(
+		cwd,
+		join(runtimeDataDir, 'graph-lite'),
+		config.enableGraphLite === true,
+		config.graphLiteMaxFiles,
+	)
 	const contextArtifacts = new ContextArtifactCache()
 	const memoryTools = createMemoryTools({
 		cavemem: {
@@ -216,6 +352,120 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 	const lastPromptBySession = new Map<string, string>()
 	const MAX_SESSION_CACHE = 50
+
+	// --- New runtime managers ---
+	const sessionRecoveryManager = new SessionRecoveryManager(input.client as any, cwd, {
+		enabled: config.enableSessionRecovery === true,
+	})
+	const qualityScorer = new QualityScorer({ enabled: config.enableQualityScorer === true })
+	const qualitySignalsBySession = new Map<
+		string,
+		{
+			repeatedReads: number
+			largeOutputCount: number
+			archivePressure: number
+			compactionCount: number
+			verificationPasses: number
+			verificationFails: number
+			phaseCycles: number
+		}
+	>()
+	const rgAvailable = checkBinary('rg')
+	const hostSearchResultsBySession = new Map<string, string>()
+	const MAX_HOST_SEARCH_CACHE = 100
+
+	// --- End new runtime managers ---
+
+	function getOrCreateQualitySignals(sessionID: string) {
+		let signals = qualitySignalsBySession.get(sessionID)
+		if (!signals) {
+			signals = {
+				repeatedReads: 0,
+				largeOutputCount: 0,
+				archivePressure: 0,
+				compactionCount: 0,
+				verificationPasses: 0,
+				verificationFails: 0,
+				phaseCycles: 0,
+			}
+			qualitySignalsBySession.set(sessionID, signals)
+		}
+		return signals
+	}
+
+	function buildDoctorProbeContext(directory: string): DoctorProbeContext {
+		return {
+			cwd: directory,
+			runtimeDataDir,
+			config: {
+				enableMemory: config.enableMemory !== false,
+				enableHooks: config.enableHooks !== false,
+				enableCompaction: config.enableCompaction !== false,
+				enableSessionRetry: config.enableSessionRetry === true,
+				enableSessionRecovery: config.enableSessionRecovery === true,
+				enableSessionPrimer: config.enableSessionPrimer === true,
+				enableProgressiveCheckpoints: config.enableProgressiveCheckpoints === true,
+				enableGraphLite: config.enableGraphLite === true,
+				enableRtk: config.enableRtk === true,
+				enableCavememBridge: config.enableCavememBridge !== false,
+				enableCavememMcp: config.enableCavememMcp !== false,
+				enablePendingTodoReminders: config.enablePendingTodoReminders === true,
+				enableSnapshots: config.enableSnapshots === true,
+				enableToolArchive: config.enableToolArchive === true,
+				enableDeltaRead: config.enableDeltaRead === true,
+			},
+			binaries: {
+				rtkAvailable,
+				cavememAvailable,
+				rgAvailable,
+				gitAvailable: checkBinary('git'),
+				bunAvailable: checkBinary('bun'),
+			},
+			plugins: {
+				discovered: report.discovered,
+				enabled: report.enabled,
+				blocked: report.blocked,
+				malformed: report.malformed,
+			},
+			graphLiteStatus: graphLite.getStatus(),
+			specPresent: fileExists(join(directory, 'SPEC.md')),
+		}
+	}
+
+	function refreshDoctorSummary(sessionID: string, directory: string = cwd): string {
+		if (config.enableDoctor === false) return ''
+		const summary = renderDoctorSummary(runDoctorProbes(buildDoctorProbeContext(directory))).replace(
+			/^doctor:\s*/,
+			'',
+		)
+		getSessionRuntime(sessionID).setDoctorSummary(summary)
+		return summary
+	}
+
+	function scoreSessionQuality(sessionID: string) {
+		if (config.enableQualityScorer !== true) return null
+		const signals = getOrCreateQualitySignals(sessionID)
+		const result = qualityScorer.score({
+			repeatedReads: signals.repeatedReads,
+			largeOutputCount: signals.largeOutputCount,
+			archivePressure: signals.archivePressure,
+			compactionCount: signals.compactionCount,
+			verificationPassRate: signals.verificationPasses,
+			verificationTotal: signals.verificationPasses + signals.verificationFails,
+			todoPressure: pendingTodos.pending(sessionID).length,
+			phaseCycles: signals.phaseCycles,
+		})
+		getSessionRuntime(sessionID).setQualitySummary(qualityScorer.renderCompactSummary(result))
+		checkpointManager.updateQuality(sessionID, result.score, result.grade)
+		return result
+	}
+
+	function refreshRecoverySummary(sessionID: string): string {
+		const audit = sessionRecoveryManager.getAudit(sessionID)
+		const summary = audit ? `retries=${audit.totalRetries} class=${audit.lastClassification ?? 'n/a'}` : ''
+		getSessionRuntime(sessionID).setRecoverySummary(summary)
+		return summary
+	}
 
 	function getSessionState(sessionID: string): SessionStateTracker {
 		const existing = sessionStateBySession.get(sessionID)
@@ -417,6 +667,45 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		return { written, deleted }
 	}
 
+	async function appendPromptToSession(sessionID: string, text: string): Promise<void> {
+		if (!text.trim()) return
+		const tui = (input.client as any).tui
+		if (!tui?.appendPrompt) return
+		await Promise.resolve(
+			tui.appendPrompt({
+				body: { text },
+				query: { directory: cwd },
+			}),
+		)
+	}
+
+	function maybeCaptureHarnessSnapshots(toolName: string, sessionID: string, args: Record<string, unknown>): void {
+		if (config.enableSnapshots !== true) return
+		const capturePaths: string[] = []
+		if (toolName === 'openharness_cavekit_spec' || toolName === 'openharness_cavekit_backprop') {
+			capturePaths.push(resolveCaveKitSpecPath(cwd))
+		}
+		if (toolName === 'openharness_cavekit_build') {
+			capturePaths.push(resolveCaveKitSpecPath(cwd))
+			const writeFiles = Array.isArray(args.writeFiles) ? args.writeFiles : []
+			for (const entry of writeFiles) {
+				if (!entry || typeof entry !== 'object') continue
+				const path =
+					typeof (entry as { path?: unknown }).path === 'string' ? (entry as { path: string }).path : ''
+				if (path) capturePaths.push(resolveRepoLocalPath(cwd, path))
+			}
+			const deleteFiles = Array.isArray(args.deleteFiles) ? args.deleteFiles : []
+			for (const entry of deleteFiles) {
+				if (typeof entry !== 'string') continue
+				capturePaths.push(resolveRepoLocalPath(cwd, entry))
+			}
+		}
+		if (toolName === 'openharness_caveman_compress_file' && typeof args.filePath === 'string') {
+			capturePaths.push(resolveRepoLocalPath(cwd, args.filePath))
+		}
+		for (const absPath of capturePaths) snapshotManager.capture(cwd, sessionID, absPath)
+	}
+
 	function recordInvokedSkill(sessionID: string, skillName: string): void {
 		const existing = invokedSkillsBySession.get(sessionID) ?? new Set<string>()
 		existing.add(skillName)
@@ -429,6 +718,8 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		if (lastPromptBySession.has(sessionID)) lastPromptBySession.delete(sessionID)
 		lastPromptBySession.set(sessionID, prompt.trim())
 		trimSessionCache(lastPromptBySession, MAX_SESSION_CACHE)
+		checkpointManager.recordMessage(sessionID, prompt.length)
+		checkpointManager.recordDecision(sessionID, `prompt: ${truncateStr(prompt.trim(), 120)}`)
 		const sessionState = getSessionState(sessionID)
 		sessionState.updateGoal(prompt.trim())
 		setSessionNextStep(sessionID, 'Continue the active task and verify the result.')
@@ -442,6 +733,19 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		cavemanStateBySession.delete(sessionID)
 		persistentHookContextBySession.delete(sessionID)
 		promptHookContextBySession.delete(sessionID)
+		sessionPrimerBySession.delete(sessionID)
+		deltaReadManager.reset(sessionID)
+		sessionRetryManager.reset(sessionID)
+		sessionRecoveryManager.reset(sessionID)
+		checkpointManager.reset(sessionID)
+		pendingTodos.reset(sessionID)
+		qualityScorer.reset(sessionID)
+		qualitySignalsBySession.delete(sessionID)
+		sessionPrimer.reset(sessionID)
+		// Clean up any stale host search results for this session
+		for (const key of hostSearchResultsBySession.keys()) {
+			if (key.startsWith(`${sessionID}:`)) hostSearchResultsBySession.delete(key)
+		}
 	}
 
 	function findMatchingHooks(openCodeEvent: string, subject?: string): CompatHook[] {
@@ -523,6 +827,114 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		tool: {
 			...(config.enableMemory ? memoryTools : {}),
 			...cavememInspectTools,
+			openharness_expand: toolFn({
+				description: 'Retrieve a full tool result previously archived behind a compact preview.',
+				args: {
+					id: z.string().describe('Archive id returned by the compact preview'),
+				},
+				async execute(args) {
+					const entry = archiveManager.retrieve(args.id)
+					if (!entry) return `Archive entry '${args.id}' not found.`
+					return entry.output
+				},
+			}),
+			expand: toolFn({
+				description: 'Compatibility alias for openharness_expand.',
+				args: {
+					id: z.string().describe('Archive id returned by the compact preview'),
+				},
+				async execute(args) {
+					const entry = archiveManager.retrieve(args.id)
+					if (!entry) return `Archive entry '${args.id}' not found.`
+					return entry.output
+				},
+			}),
+			openharness_graph_status: toolFn({
+				description: 'Show graph-lite readiness or trigger an on-demand index scan.',
+				args: {
+					action: z.enum(['status', 'scan']).optional().describe('status (default) or scan'),
+				},
+				async execute(args) {
+					const status = args.action === 'scan' ? await graphLite.scan() : graphLite.getStatus()
+					return [
+						`State: ${status.state}`,
+						`Ready: ${status.ready ? 'yes' : 'no'}`,
+						`Files: ${status.stats?.files ?? 0}`,
+						`Symbols: ${status.stats?.symbols ?? 0}`,
+						`Edges: ${status.stats?.edges ?? 0}`,
+						`Updated: ${status.updatedAt ? new Date(status.updatedAt).toISOString() : 'n/a'}`,
+						`Message: ${status.message ?? 'n/a'}`,
+					].join('\n')
+				},
+			}),
+			openharness_graph_query: toolFn({
+				description: 'Query graph-lite file importance, symbols, dependencies, dependents, or blast radius.',
+				args: {
+					action: z.enum(['top_files', 'file_symbols', 'file_deps', 'file_dependents', 'blast_radius']),
+					file: z.string().optional().describe('Repo-local file path for file-scoped graph queries'),
+					limit: z.number().optional().describe('Optional result limit'),
+				},
+				async execute(args) {
+					const status = graphLite.getStatus()
+					if (!status.ready) return 'Graph-lite not ready. Run openharness_graph_status action="scan" first.'
+					if (args.action === 'top_files') {
+						const rows = graphLite.getTopFiles(args.limit ?? 10)
+						if (rows.length === 0) return 'No indexed files.'
+						return rows
+							.map(
+								row =>
+									`- ${row.path} (score ${row.score.toFixed(2)}, ${row.lines} lines, ${row.symbols} symbols)`,
+							)
+							.join('\n')
+					}
+					if (!args.file) return 'file parameter required'
+					if (args.action === 'file_symbols') {
+						const symbols = graphLite.getFileSymbols(args.file)
+						if (symbols.length === 0) return `No symbols found in ${args.file}`
+						return symbols
+							.slice(0, args.limit ?? 20)
+							.map(
+								symbol =>
+									`- ${symbol.name} (${symbol.kind})${symbol.isExported ? ' [exported]' : ''} [line ${symbol.line}]`,
+							)
+							.join('\n')
+					}
+					if (args.action === 'file_deps') {
+						const deps = graphLite.getFileDependencies(args.file)
+						return deps.length > 0
+							? deps
+									.slice(0, args.limit ?? 20)
+									.map(dep => `- ${dep}`)
+									.join('\n')
+							: `No dependencies found for ${args.file}`
+					}
+					if (args.action === 'file_dependents') {
+						const dependents = graphLite.getFileDependents(args.file)
+						return dependents.length > 0
+							? dependents
+									.slice(0, args.limit ?? 20)
+									.map(dep => `- ${dep}`)
+									.join('\n')
+							: `No dependents found for ${args.file}`
+					}
+					return `Blast radius for ${args.file}: ${graphLite.getBlastRadius(args.file)} file(s)`
+				},
+			}),
+			openharness_fs_undo: toolFn({
+				description: 'Restore the latest snapshot captured for a harness-owned file mutation.',
+				args: {
+					filePath: z.string().describe('Repo-local file path to restore from the latest snapshot'),
+				},
+				async execute(args, ctx) {
+					const restored = snapshotManager.restoreLatest(ctx.directory, args.filePath)
+					if (!restored) return `No snapshot found for ${args.filePath}`
+					return [
+						`File: ${args.filePath}`,
+						`Restored from: ${new Date(restored.timestamp).toISOString()}`,
+						`State: ${restored.exists ? 'restored prior content' : 'deleted file restored to missing state'}`,
+					].join('\n')
+				},
+			}),
 			openharness_cavemem_recall: toolFn({
 				description:
 					'Canonical CaveMem recall surface for project memory, sessions, timeline, and observations.',
@@ -943,11 +1355,45 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				if (!sessionID) return null
 				return getSessionRuntime(sessionID).snapshot()
 			}),
+			openharness_doctor: toolFn({
+				description:
+					'Run OpenHarness doctor probes to check runtime health: binaries, plugins, config, and feature readiness.',
+				args: {
+					verbose: z.boolean().optional().describe('Include all checks including OK results'),
+				},
+				async execute(args, ctx) {
+					const doctorReport = runDoctorProbes(buildDoctorProbeContext(ctx.directory))
+					if (ctx.sessionID)
+						getSessionRuntime(ctx.sessionID).setDoctorSummary(renderDoctorSummary(doctorReport))
+					return renderDoctorReport(doctorReport, args.verbose === true)
+				},
+			}),
+			openharness_recovery_audit: toolFn({
+				description: 'Show session recovery audit trail: retry attempts, classifications, and backoff history.',
+				args: {},
+				async execute(_args, ctx) {
+					return sessionRecoveryManager.renderAudit(ctx.sessionID)
+				},
+			}),
+			openharness_quality: toolFn({
+				description: 'Show session quality score and signal breakdown for the current session.',
+				args: {},
+				async execute(_args, ctx) {
+					const result = scoreSessionQuality(ctx.sessionID)
+					if (!result) return 'No quality signals recorded for this session.'
+					return qualityScorer.renderQuality(result)
+				},
+			}),
 		},
 
 		'tool.execute.before':
-			config.enableHooks || config.enableRtk
+			config.enableHooks || config.enableRtk || config.enableSnapshots === true
 				? async (hookInput, output) => {
+						maybeCaptureHarnessSnapshots(
+							hookInput.tool,
+							hookInput.sessionID,
+							(output.args ?? {}) as Record<string, unknown>,
+						)
 						if (config.enableHooks) {
 							const subject = hookInput.tool
 							const { blocked } = await runMatchingHooks(
@@ -977,7 +1423,42 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 									(compression.mode === 'rewritten' || compression.mode === 'proxied') &&
 									compression.finalCommand !== command
 								) {
-									output.args = { ...(output.args ?? {}), command: compression.finalCommand }
+									output.args = { ...output.args, command: compression.finalCommand }
+								}
+							}
+						}
+
+						// Host-side grep fast-path (T6)
+						if (config.enableHostGrep !== false && hookInput.tool === 'grep') {
+							const pattern = typeof output.args?.pattern === 'string' ? output.args.pattern : ''
+							const include = typeof output.args?.include === 'string' ? output.args.include : undefined
+							if (pattern) {
+								const fastResult = hostGrepFastPath(cwd, pattern, include)
+								if (fastResult !== null) {
+									const rendered = renderGroupedGrepOutput(fastResult, {
+										query: pattern,
+										includePattern: include,
+									})
+									hostSearchResultsBySession.set(
+										`${hookInput.sessionID}:${hookInput.callID}`,
+										rendered,
+									)
+									trimSessionCache(hostSearchResultsBySession as any, MAX_HOST_SEARCH_CACHE)
+								}
+							}
+						}
+
+						// Host-side glob fast-path (T7)
+						if (config.enableHostGlob !== false && hookInput.tool === 'glob') {
+							const pattern = typeof output.args?.pattern === 'string' ? output.args.pattern : ''
+							if (pattern) {
+								const fastResult = hostGlobFastPath(cwd, pattern)
+								if (fastResult !== null) {
+									hostSearchResultsBySession.set(
+										`${hookInput.sessionID}:${hookInput.callID}`,
+										fastResult,
+									)
+									trimSessionCache(hostSearchResultsBySession as any, MAX_HOST_SEARCH_CACHE)
 								}
 							}
 						}
@@ -1006,9 +1487,48 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			const sessionState = getSessionState(hookInput.sessionID)
 			const sessionRuntime = getSessionRuntime(hookInput.sessionID)
 			sessionRuntime.noteTool(hookInput.tool, hookInput.args)
+			checkpointManager.recordDecision(
+				hookInput.sessionID,
+				`${hookInput.tool}${hookInput.args ? ` ${truncateStr(JSON.stringify(hookInput.args), 120)}` : ''}`,
+			)
 			sessionState.addWorkLogEntry(
 				`${hookInput.tool}${hookInput.args ? `: ${truncateStr(JSON.stringify(hookInput.args), 80)}` : ''}`,
 			)
+			if (hookInput.tool === 'read' && typeof hookInput.args?.filePath === 'string') {
+				const delta = deltaReadManager.processRead(
+					hookInput.sessionID,
+					hookInput.args.filePath,
+					toolOutput.output,
+				)
+				if (delta) toolOutput.output = delta
+			}
+
+			// --- Host-side grep/glob output replacement (T6/T7 V2) ---
+			const hostResult = hostSearchResultsBySession.get(`${hookInput.sessionID}:${hookInput.callID}`)
+			if (hostResult) {
+				toolOutput.output = hostResult
+				hostSearchResultsBySession.delete(`${hookInput.sessionID}:${hookInput.callID}`)
+			}
+
+			const archived = archiveManager.maybeArchive(hookInput.sessionID, hookInput.tool, toolOutput.output)
+			if (archived) toolOutput.output = formatArchivedOutput(archived)
+
+			// --- Quality signal tracking (T16) ---
+			if (config.enableQualityScorer === true) {
+				const signals = getOrCreateQualitySignals(hookInput.sessionID)
+				if (hookInput.tool === 'read') {
+					signals.repeatedReads += 1
+				}
+				if (hookInput.tool === 'grep' || hookInput.tool === 'glob') {
+					signals.phaseCycles += 1
+				}
+				if (toolOutput.output && toolOutput.output.length > 5000) {
+					signals.largeOutputCount += 1
+				}
+				if (archived) {
+					signals.archivePressure += 1
+				}
+			}
 			if (hookInput.tool === 'read' || hookInput.tool === 'glob') {
 				const path =
 					typeof hookInput.args?.filePath === 'string'
@@ -1019,7 +1539,23 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				if (path) {
 					sessionState.addArtifact(path)
 					sessionRuntime.setCurrentTarget(path)
+					checkpointManager.recordFileActivity(hookInput.sessionID, path)
 				}
+			}
+			if (
+				config.enablePendingTodoReminders === true &&
+				hookInput.tool === 'todowrite' &&
+				Array.isArray(hookInput.args?.todos)
+			) {
+				const todos = hookInput.args.todos
+					.filter((todo: unknown) => todo && typeof todo === 'object')
+					.map((todo: unknown) => {
+						const record = todo as { status?: unknown; content?: unknown }
+						return { status: String(record.status ?? ''), content: String(record.content ?? '') }
+					})
+					.filter((todo: { status: string; content: string }) => todo.content.trim().length > 0)
+				pendingTodos.update(hookInput.sessionID, todos)
+				checkpointManager.updateTodos(hookInput.sessionID, todos)
 			}
 			maybeRecordVerificationState(sessionState, sessionRuntime, hookInput, toolOutput)
 			const verification = classifyVerification({
@@ -1029,6 +1565,22 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			})
 			if (verification) {
 				sessionRuntime.noteVerification(verification)
+				checkpointManager.recordVerification(hookInput.sessionID, verification.summary)
+				// Quality tracking for verification
+				if (config.enableQualityScorer === true) {
+					const signals = getOrCreateQualitySignals(hookInput.sessionID)
+					if (verification.status === 'pass') signals.verificationPasses += 1
+					if (verification.status === 'fail') signals.verificationFails += 1
+				}
+				// Checkpoint quality degradation trigger (T20)
+				if (config.enableQualityScorer === true && config.enableProgressiveCheckpoints === true) {
+					const qualityResult = scoreSessionQuality(hookInput.sessionID)
+					if (qualityResult) {
+						checkpointManager.maybeCaptureOnQuality(hookInput.sessionID, qualityResult.grade)
+						const nudge = qualityScorer.getNudge(hookInput.sessionID, qualityResult)
+						if (nudge) await appendPromptToSession(hookInput.sessionID, nudge.message)
+					}
+				}
 				if (cavekitMutatorMode === 'opencode-integrated') {
 					applyVerificationToSpec(sessionRuntime.snapshot().plan, verification)
 				}
@@ -1047,6 +1599,11 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			}
 
 			if (config.enableCompaction) {
+				// Track compaction for quality scoring
+				if (config.enableQualityScorer === true) {
+					const signals = getOrCreateQualitySignals(hookInput.sessionID)
+					signals.compactionCount += 1
+				}
 				const runtimeSnapshot = getSessionRuntime(hookInput.sessionID).snapshot()
 				const recalledMemories = await recallProjectMemories(
 					getLastPrompt(lastPromptBySession, hookInput.sessionID),
@@ -1074,13 +1631,53 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				if (formatted) {
 					output.context.push(truncateCompactionContext(formatted))
 				}
+				const restoreContext = checkpointManager.buildRestoreContext(hookInput.sessionID)
+				if (restoreContext) output.context.push(restoreContext)
 			}
 		},
 
 		'experimental.chat.system.transform': async (_input, output) => {
 			const sessionID = _input.sessionID
 			const cavemanState = getCavemanState(sessionID)
+			if (sessionID) {
+				refreshDoctorSummary(sessionID)
+				if (config.enableQualityScorer === true) scoreSessionQuality(sessionID)
+				refreshRecoverySummary(sessionID)
+			}
 			const runtimeSnapshot = sessionID ? getSessionRuntime(sessionID).snapshot() : null
+			if (sessionID && sessionPrimer.isEnabled()) {
+				const runtimeSnap = sessionID ? getSessionRuntime(sessionID).snapshot() : null
+				const primerSnapshot =
+					sessionPrimerBySession.get(sessionID) ??
+					sessionPrimer.buildSnapshot({
+						cwd,
+						planMode: runtimeSnap?.plan?.mode,
+						currentTarget: runtimeSnap?.currentTarget,
+						nextStep: runtimeSnap?.nextStep,
+						graph: graphLite,
+						pendingTodoCount:
+							config.enablePendingTodoReminders === true ? pendingTodos.pending(sessionID).length : 0,
+						latestVerificationStatus: runtimeSnap?.verificationRecords.at(-1)?.status ?? '',
+						qualityGrade:
+							config.enableQualityScorer === true
+								? (() => {
+										const signals = qualitySignalsBySession.get(sessionID)
+										if (!signals) return ''
+										return qualityScorer.score({
+											repeatedReads: signals.repeatedReads,
+											largeOutputCount: signals.largeOutputCount,
+											archivePressure: signals.archivePressure,
+											compactionCount: signals.compactionCount,
+											verificationPassRate: signals.verificationPasses,
+											verificationTotal: signals.verificationPasses + signals.verificationFails,
+											todoPressure: pendingTodos.pending(sessionID).length,
+											phaseCycles: signals.phaseCycles,
+										}).grade
+									})()
+								: '',
+					})
+				output.system.push(sessionPrimer.render(primerSnapshot))
+			}
 			if (cavemanState.enabled) {
 				output.system.push(buildCavemanSystemPrompt(cavemanState.mode))
 			}
@@ -1220,6 +1817,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				setHookContext(promptHookContextBySession, hookInput.sessionID, collectHookContext(results))
 			}
 			if (prompt) {
+				sessionRetryManager.rememberPrompt(hookInput.sessionID, {
+					messageID: hookInput.messageID ?? `retry-${Date.now()}`,
+					text: prompt,
+					agent: hookInput.agent,
+					model: hookInput.model,
+				})
 				sessionRuntime.setPhase('compile-prompt')
 				if (config.enableCavememBridge !== false) {
 					recordCaveMemUserPrompt(
@@ -1230,6 +1833,20 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					)
 				}
 				setLastPrompt(hookInput.sessionID, prompt)
+				const primerSeed = sessionPrimer.buildSnapshot({
+					cwd,
+					planMode: sessionRuntime.snapshot().plan?.mode,
+					currentTarget: sessionRuntime.snapshot().currentTarget,
+					nextStep: sessionRuntime.snapshot().nextStep,
+					graph: graphLite,
+					pendingTodoCount:
+						config.enablePendingTodoReminders === true
+							? pendingTodos.pending(hookInput.sessionID).length
+							: 0,
+					latestVerificationStatus: sessionRuntime.snapshot().verificationRecords.at(-1)?.status ?? '',
+				})
+				sessionPrimerBySession.set(hookInput.sessionID, primerSeed)
+				trimSessionCache(sessionPrimerBySession, MAX_SESSION_CACHE)
 				const compiledPrompt = compileUserPrompt(prompt)
 				sessionRuntime.setCompiledPrompt(compiledPrompt)
 				const planningRootContext = discoverRootContext(cwd, {
@@ -1240,12 +1857,14 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				const planningMemories = config.enableMemory
 					? await recallProjectMemories(prompt, cwd, hookInput.sessionID, 3)
 					: []
+				const discoveryHints = primerSeed.topFiles
 				const sessionState = getSessionState(hookInput.sessionID)
 				const plan = buildExecutionPlan({
 					compiledPrompt,
 					rootContext: planningRootContext,
 					memories: planningMemories,
 					taskFocus: sessionState.getTaskFocus(),
+					discoveryHints,
 				})
 				sessionRuntime.setPlan(plan)
 				sessionState.updateGoal(plan.goal)
@@ -1253,6 +1872,22 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					hookInput.sessionID,
 					plan.steps[0]?.title ?? 'Apply next planned step and verify result.',
 				)
+				sessionPrimerBySession.set(
+					hookInput.sessionID,
+					sessionPrimer.buildSnapshot({
+						cwd,
+						planMode: plan.mode,
+						currentTarget: plan.steps[0]?.title ?? sessionRuntime.snapshot().currentTarget,
+						nextStep: plan.steps[0]?.title ?? sessionRuntime.snapshot().nextStep,
+						graph: graphLite,
+						pendingTodoCount:
+							config.enablePendingTodoReminders === true
+								? pendingTodos.pending(hookInput.sessionID).length
+								: 0,
+						latestVerificationStatus: sessionRuntime.snapshot().verificationRecords.at(-1)?.status ?? '',
+					}),
+				)
+				trimSessionCache(sessionPrimerBySession, MAX_SESSION_CACHE)
 			} else if (hookInput.messageID) {
 				getSessionState(hookInput.sessionID)
 				getSessionRuntime(hookInput.sessionID)
@@ -1262,6 +1897,21 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		event: async ({ event }) => {
 			const type = event.type as string
 			const sessionId = extractSessionId(event)
+			if (type === 'session.error' && sessionId) {
+				if (config.enableSessionRecovery === true) {
+					const lastRetryPrompt = lastPromptBySession.has(sessionId)
+						? { messageID: `recovery-${Date.now()}`, text: lastPromptBySession.get(sessionId) ?? '' }
+						: undefined
+					await sessionRecoveryManager.handleSessionError(
+						event as Record<string, unknown>,
+						sessionId,
+						lastRetryPrompt,
+					)
+					refreshRecoverySummary(sessionId)
+				} else {
+					await sessionRetryManager.handleSessionError(event as Record<string, unknown>, sessionId)
+				}
+			}
 			if (config.enableCavememBridge !== false && type === 'session.created' && sessionId) {
 				startCaveMemSession(sessionId, cwd, getCaveMemRuntimeOptions(sessionId))
 				getSessionRuntime(sessionId).setMemorySessionPointer(`cavemem://session/${sessionId}`)
@@ -1270,6 +1920,26 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				const runtime = getSessionRuntime(sessionId)
 				runtime.setPhase('load-context')
 				runtime.setMemoryProtocol(describeMemoryProtocol())
+				refreshDoctorSummary(sessionId)
+			}
+
+			if (
+				config.enablePendingTodoReminders === true &&
+				(type === 'todo.updated' || type === 'todos.updated') &&
+				sessionId
+			) {
+				const todos = extractPendingTodos(event)
+				pendingTodos.update(sessionId, todos)
+				checkpointManager.updateTodos(sessionId, todos)
+			}
+
+			if (
+				config.enablePendingTodoReminders === true &&
+				(type === 'session.idle' || type === 'session.completed') &&
+				sessionId
+			) {
+				const reminder = pendingTodos.buildReminder(sessionId)
+				if (reminder) await appendPromptToSession(sessionId, reminder)
 			}
 
 			if (config.enableHooks) {
@@ -1404,7 +2074,7 @@ function collectStructuredHookContext(parsed: unknown): string[] {
 }
 
 function tryParseJson(input: string): unknown {
-	if (!/^[\[{]/.test(input)) return null
+	if (!/^(?:\[|{)/.test(input)) return null
 	try {
 		return JSON.parse(input)
 	} catch {
@@ -1470,12 +2140,29 @@ function buildRuntimeOpsLogSummary(sessionID: string, snapshot: ReturnType<Sessi
 	if (snapshot.currentTarget) parts.push(`target=${truncateStr(snapshot.currentTarget, 80)}`)
 	if (snapshot.memoryProtocol) parts.push(`memproto=${snapshot.memoryProtocol}`)
 	if (snapshot.memorySessionPointer) parts.push(`memory=${snapshot.memorySessionPointer}`)
+	if (snapshot.doctorSummary) parts.push(`doctor=${truncateStr(snapshot.doctorSummary, 60)}`)
+	if (snapshot.qualitySummary) parts.push(`quality=${truncateStr(snapshot.qualitySummary, 60)}`)
+	if (snapshot.recoverySummary) parts.push(`recovery=${truncateStr(snapshot.recoverySummary, 60)}`)
 	if (snapshot.verificationRecords.length > 0) {
 		const lastVerification = snapshot.verificationRecords[snapshot.verificationRecords.length - 1]
 		parts.push(`verify=${lastVerification.status}:${truncateStr(lastVerification.command, 60)}`)
 	}
 	parts.push(`telemetry=${formatTelemetrySummary(snapshot)}`)
 	return `Runtime ops summary | ${parts.join(' | ')}`
+}
+
+function extractPendingTodos(event: Record<string, unknown>): Array<{ status: string; content: string }> {
+	const properties = event.properties
+	if (!properties || typeof properties !== 'object') return []
+	const raw = (properties as Record<string, unknown>).todos
+	if (!Array.isArray(raw)) return []
+	return raw
+		.filter((entry: unknown) => entry && typeof entry === 'object')
+		.map((entry: unknown) => {
+			const todo = entry as { status?: unknown; content?: unknown }
+			return { status: String(todo.status ?? ''), content: String(todo.content ?? '') }
+		})
+		.filter((entry: { status: string; content: string }) => entry.content.trim().length > 0)
 }
 
 function normalizeCavemanMode(raw: unknown): CavemanMode {

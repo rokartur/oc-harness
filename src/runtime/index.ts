@@ -23,6 +23,60 @@ export {
 	type ParsedCaveKitSpec,
 } from './spec.js'
 export { SessionRuntimeTracker } from './session-runtime.js'
+export { DeltaReadManager, type DeltaReadOptions } from './delta-read.js'
+export {
+	ToolArchiveManager,
+	formatArchivedOutput,
+	type ToolArchiveEntry,
+	type ToolArchiveOptions,
+} from './tool-archive.js'
+export { SessionRetryManager, looksRetryableTimeout, type RetryPromptRecord } from './session-retry.js'
+export { SessionPrimer, type SessionPrimerSnapshot, type PrimerTier } from './session-primer.js'
+export { ProgressiveCheckpointManager, type CheckpointRecord, type CheckpointTodo } from './checkpoints.js'
+export { SnapshotManager, type SnapshotPayload } from './snapshots.js'
+export { PendingTodosTracker, type PendingTodoItem } from './pending-todos.js'
+export {
+	GraphLiteService,
+	type GraphLiteFile,
+	type GraphLiteState,
+	type GraphLiteStats,
+	type GraphLiteStatus,
+	type GraphLiteSymbol,
+} from './graph-lite.js'
+export {
+	runDoctorProbes,
+	renderDoctorReport,
+	renderDoctorSummary,
+	checkBinary,
+	type DoctorCheckResult,
+	type DoctorReport,
+	type DoctorProbeContext,
+	type DoctorStatus,
+} from './doctor.js'
+export {
+	renderSearchResults,
+	renderGroupedGrepOutput,
+	parseGrepOutput,
+	clipLine,
+	groupMatches,
+	type SearchMatch,
+	type GroupedSearchResult,
+} from './search-render.js'
+export {
+	SessionRecoveryManager,
+	type RecoveryClass,
+	type RecoveryPolicy,
+	type RecoveryAttempt,
+	type RecoveryAuditEntry,
+	truncateError,
+} from './session-recovery.js'
+export {
+	QualityScorer,
+	type QualityGrade,
+	type QualitySignals,
+	type QualityScoreResult,
+	type QualityNudge,
+} from './quality-score.js'
 export type {
 	CompiledPrompt,
 	PromptConstraint,

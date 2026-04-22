@@ -265,6 +265,9 @@ export function createRuntimeStatusTool(
 			if (snapshot.currentTarget) lines.push(`Current target: ${snapshot.currentTarget}`)
 			if (snapshot.memoryProtocol) lines.push(`Memory protocol: ${snapshot.memoryProtocol}`)
 			if (snapshot.memorySessionPointer) lines.push(`Memory session: ${snapshot.memorySessionPointer}`)
+			if (snapshot.doctorSummary) lines.push(`Doctor: ${snapshot.doctorSummary}`)
+			if (snapshot.qualitySummary) lines.push(`Quality: ${snapshot.qualitySummary}`)
+			if (snapshot.recoverySummary) lines.push(`Recovery: ${snapshot.recoverySummary}`)
 			lines.push(`Elapsed: ${formatElapsed(snapshot.startedAt)}`)
 			lines.push(`Updated: ${new Date(snapshot.updatedAt).toISOString()}`)
 			lines.push('Composition: caveman primitive | cavekit workflow | cavemem memory | flagship runtime')
@@ -325,6 +328,9 @@ export function createTelemetrySnapshotTool(
 			if (snapshot.currentTarget) lines.push(`Current target: ${snapshot.currentTarget}`)
 			if (snapshot.memoryProtocol) lines.push(`Memory protocol: ${snapshot.memoryProtocol}`)
 			if (snapshot.memorySessionPointer) lines.push(`Memory: ${snapshot.memorySessionPointer}`)
+			if (snapshot.doctorSummary) lines.push(`Doctor: ${snapshot.doctorSummary}`)
+			if (snapshot.qualitySummary) lines.push(`Quality: ${snapshot.qualitySummary}`)
+			if (snapshot.recoverySummary) lines.push(`Recovery: ${snapshot.recoverySummary}`)
 			lines.push('')
 			lines.push(`L01 prompt: ${formatTelemetry(snapshot.telemetry.l01Prompt)}`)
 			lines.push(`L02 tool: ${formatTelemetry(snapshot.telemetry.l02Tool)}`)
@@ -359,6 +365,9 @@ export function createBenchmarkSnapshotTool(
 				currentTarget: snapshot.currentTarget,
 				memoryProtocol: snapshot.memoryProtocol,
 				memorySessionPointer: snapshot.memorySessionPointer,
+				doctorSummary: snapshot.doctorSummary,
+				qualitySummary: snapshot.qualitySummary,
+				recoverySummary: snapshot.recoverySummary,
 				elapsedMs: Math.max(0, Date.now() - snapshot.startedAt),
 				updatedAt: new Date(snapshot.updatedAt).toISOString(),
 				verification: snapshot.verificationRecords.at(-1) ?? null,
@@ -375,6 +384,9 @@ export function createBenchmarkSnapshotTool(
 				`Task coverage: ${benchmark.taskCoverage}`,
 				`Current target: ${benchmark.currentTarget || 'n/a'}`,
 				`Memory protocol: ${benchmark.memoryProtocol || 'n/a'}`,
+				`Doctor: ${benchmark.doctorSummary || 'n/a'}`,
+				`Quality: ${benchmark.qualitySummary || 'n/a'}`,
+				`Recovery: ${benchmark.recoverySummary || 'n/a'}`,
 				`Elapsed: ${formatElapsed(snapshot.startedAt)}`,
 				`L01 prompt: ${formatTelemetry(snapshot.telemetry.l01Prompt)}`,
 				`L02 tool: ${formatTelemetry(snapshot.telemetry.l02Tool)}`,

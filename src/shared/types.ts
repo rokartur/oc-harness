@@ -109,6 +109,27 @@ export interface PluginConfig {
 	enableHooks?: boolean
 	enableMemory?: boolean
 	enableCompaction?: boolean
+	enableDeltaRead?: boolean
+	deltaReadMaxCachePerSession?: number
+	deltaReadMaxDiffChars?: number
+	deltaReadExcludePatterns?: string[]
+	enableToolArchive?: boolean
+	toolArchiveThresholdChars?: number
+	toolArchiveExemptTools?: string[]
+	enableSessionRetry?: boolean
+	sessionRetryBackoffMs?: number
+	enableSessionRecovery?: boolean
+	enableSessionPrimer?: boolean
+	enableProgressiveCheckpoints?: boolean
+	enablePersistedCheckpoints?: boolean
+	enableQualityScorer?: boolean
+	enableHostGrep?: boolean
+	enableHostGlob?: boolean
+	enableDoctor?: boolean
+	enableSnapshots?: boolean
+	enablePendingTodoReminders?: boolean
+	enableGraphLite?: boolean
+	graphLiteMaxFiles?: number
 	enableClaudeRulesCompat?: boolean
 	enableClaudeMdContext?: boolean
 	enableAgentsMdContext?: boolean

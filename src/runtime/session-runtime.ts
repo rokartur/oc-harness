@@ -18,6 +18,9 @@ export class SessionRuntimeTracker {
 	private currentTarget = ''
 	private memoryProtocol = ''
 	private memorySessionPointer = ''
+	private doctorSummary = ''
+	private qualitySummary = ''
+	private recoverySummary = ''
 	private telemetry: SessionCompressionTelemetry = createEmptyTelemetry()
 	private verificationSummary: string[] = []
 	private verificationRecords: VerificationRecord[] = []
@@ -62,6 +65,21 @@ export class SessionRuntimeTracker {
 
 	setMemoryProtocol(protocol: string): void {
 		this.memoryProtocol = protocol.trim()
+		this.updatedAt = Date.now()
+	}
+
+	setDoctorSummary(summary: string): void {
+		this.doctorSummary = summary.trim()
+		this.updatedAt = Date.now()
+	}
+
+	setQualitySummary(summary: string): void {
+		this.qualitySummary = summary.trim()
+		this.updatedAt = Date.now()
+	}
+
+	setRecoverySummary(summary: string): void {
+		this.recoverySummary = summary.trim()
 		this.updatedAt = Date.now()
 	}
 
@@ -117,6 +135,9 @@ export class SessionRuntimeTracker {
 			currentTarget: this.currentTarget,
 			memoryProtocol: this.memoryProtocol,
 			memorySessionPointer: this.memorySessionPointer,
+			doctorSummary: this.doctorSummary,
+			qualitySummary: this.qualitySummary,
+			recoverySummary: this.recoverySummary,
 			telemetry: cloneTelemetry(this.telemetry),
 			verificationSummary: [...this.verificationSummary],
 			verificationRecords: [...this.verificationRecords],
@@ -133,6 +154,9 @@ export class SessionRuntimeTracker {
 		this.currentTarget = ''
 		this.memoryProtocol = ''
 		this.memorySessionPointer = ''
+		this.doctorSummary = ''
+		this.qualitySummary = ''
+		this.recoverySummary = ''
 		this.telemetry = createEmptyTelemetry()
 		this.verificationSummary = []
 		this.verificationRecords = []

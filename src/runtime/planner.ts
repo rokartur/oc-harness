@@ -16,13 +16,18 @@ export function buildExecutionPlan(input: {
 	rootContext: ExtraContext[]
 	memories: MemoryHeader[]
 	taskFocus: TaskFocusState
+	discoveryHints?: string[]
 }): ExecutionPlan {
 	const spec = input.rootContext.find(ctx => ctx.label === 'CaveKit Spec')
 	const parsedSpec = spec ? parseCaveKitSpec(spec.content) : null
 	const tasks = parsedSpec?.tasks ?? []
 	const mode = tasks.length > 0 ? 'spec-driven' : 'ad-hoc'
 	const validationCommands = inferValidationCommands(input.compiledPrompt, input.memories, parsedSpec)
-	const sourceArtifacts = input.rootContext.map(ctx => ctx.label)
+	const discoveryHints = input.discoveryHints ?? []
+	const sourceArtifacts = uniqueStrings([
+		...input.rootContext.map(ctx => ctx.label),
+		...discoveryHints.slice(0, 3).map(hint => `GraphLite Hint: ${hint}`),
+	])
 	const memoryRefs = input.memories.map(memory => memory.title)
 
 	if (mode === 'spec-driven') {
@@ -58,7 +63,7 @@ export function buildExecutionPlan(input: {
 		return {
 			mode,
 			goal: specDetails.goal || input.compiledPrompt.goal,
-			summary: buildSpecSummary(selectedTasks, validationCommands, specDetails),
+			summary: buildSpecSummary(selectedTasks, validationCommands, specDetails, discoveryHints),
 			steps: plannedSteps,
 			sourceArtifacts,
 			specSource: spec?.source ?? '',
@@ -67,7 +72,12 @@ export function buildExecutionPlan(input: {
 		}
 	}
 
-	const adHocSteps = buildAdHocSteps(input.compiledPrompt, input.taskFocus, validationCommands)
+	const adHocSteps = buildAdHocSteps(
+		input.compiledPrompt,
+		input.taskFocus,
+		validationCommands,
+		input.discoveryHints ?? [],
+	)
 	return {
 		mode,
 		goal: input.compiledPrompt.goal,
@@ -132,25 +142,33 @@ function buildAcceptance(task: CaveKitTask, validationCommands: string[], spec: 
 	return acceptance
 }
 
-function buildSpecSummary(tasks: CaveKitTask[], validationCommands: string[], spec: ParsedCaveKitSpec | null): string {
+function buildSpecSummary(
+	tasks: CaveKitTask[],
+	validationCommands: string[],
+	spec: ParsedCaveKitSpec | null,
+	discoveryHints: string[],
+): string {
 	const taskSummary = tasks.map(task => `${task.id}:${task.task}`).join(' | ')
 	const guardrails = spec
 		? uniqueStrings([...spec.constraints.slice(0, 1), ...spec.invariants.slice(0, 2)]).join(' | ')
 		: ''
+	const hints = discoveryHints.length > 0 ? ` Likely files: ${discoveryHints.slice(0, 3).join(', ')}.` : ''
 	const verification =
 		validationCommands.length > 0 ? ` Verify with ${formatValidationList(validationCommands)}.` : ''
 	const taskClause = taskSummary ? `Advance ${taskSummary}.` : 'No open CaveKit tasks. Validate current state.'
 	const guardrailClause = guardrails ? ` Preserve ${guardrails}.` : ''
-	return `SPEC-backed plan. ${taskClause}${guardrailClause}${verification}`.trim()
+	return `SPEC-backed plan. ${taskClause}${guardrailClause}${hints}${verification}`.trim()
 }
 
 function buildAdHocSteps(
 	compiledPrompt: CompiledPrompt,
 	taskFocus: TaskFocusState,
 	validationCommands: string[],
+	discoveryHints: string[],
 ): ExecutionStep[] {
-	const inspectTitle = taskFocus.activeArtifacts[0]
-		? `Inspect related files starting from ${taskFocus.activeArtifacts[0]}`
+	const inspectTarget = taskFocus.activeArtifacts[0] || discoveryHints[0] || ''
+	const inspectTitle = inspectTarget
+		? `Inspect related files starting from ${inspectTarget}`
 		: 'Inspect relevant files and current behavior'
 	return [
 		{
