@@ -11,12 +11,38 @@ export interface GraphLiteSymbol {
 	isExported: boolean
 }
 
+export interface GraphLiteSymbolRef {
+	symbolName: string
+	sourcePath: string
+}
+
+export interface GraphLiteBlastRadiusDetail {
+	count: number
+	files: string[]
+	scores: Array<{ path: string; depth: number }>
+}
+
+export interface GraphLiteCoChangeHint {
+	path: string
+	sharedDependents: number
+	sharedDependencies: number
+	score: number
+}
+
+export interface GraphLitePackageGroup {
+	directory: string
+	files: string[]
+	symbolCount: number
+	edgeCount: number
+}
+
 export interface GraphLiteFile {
 	path: string
 	lineCount: number
 	dependencies: string[]
 	dependents: string[]
 	symbols: GraphLiteSymbol[]
+	symbolRefs: GraphLiteSymbolRef[]
 	score: number
 }
 
@@ -24,6 +50,7 @@ export interface GraphLiteStats {
 	files: number
 	symbols: number
 	edges: number
+	symbolRefs: number
 }
 
 export interface GraphLiteStatus {
@@ -81,12 +108,14 @@ export class GraphLiteService {
 				const dependencies = extractDependencies(content, absPath, this.cwd)
 				const symbols = extractSymbols(content)
 				const lineCount = content.split('\n').length
+				const symbolRefs = extractSymbolRefs(content, absPath, this.cwd)
 				fileMap.set(relPath, {
 					path: relPath,
 					lineCount,
 					dependencies,
 					dependents: [],
 					symbols,
+					symbolRefs,
 					score: 0,
 				})
 			}
@@ -109,6 +138,7 @@ export class GraphLiteService {
 				files: files.length,
 				symbols: files.reduce((sum, file) => sum + file.symbols.length, 0),
 				edges: files.reduce((sum, file) => sum + file.dependencies.length, 0),
+				symbolRefs: files.reduce((sum, file) => sum + file.symbolRefs.length, 0),
 			}
 			this.index = { updatedAt: Date.now(), stats, files }
 			this.status = { state: 'ready', ready: true, updatedAt: this.index.updatedAt, stats }
@@ -144,19 +174,118 @@ export class GraphLiteService {
 	}
 
 	getBlastRadius(path: string): number {
+		return this.getBlastRadiusDetail(path).count
+	}
+
+	getBlastRadiusDetail(path: string): GraphLiteBlastRadiusDetail {
 		const start = this.findFile(path)
-		if (!start) return 0
-		const queue = [...start.dependents]
-		const seen = new Set<string>()
+		if (!start) return { count: 0, files: [], scores: [] }
+		const queue: Array<{ path: string; depth: number }> = start.dependents.map(d => ({ path: d, depth: 1 }))
+		const seen = new Map<string, number>()
+		for (const dep of start.dependents) {
+			if (!seen.has(dep)) seen.set(dep, 1)
+		}
 		while (queue.length > 0) {
 			const next = queue.shift()!
-			if (seen.has(next)) continue
-			seen.add(next)
-			for (const dependent of this.getFileDependents(next)) {
-				if (!seen.has(dependent)) queue.push(dependent)
+			const currentDepth = seen.get(next.path) ?? next.depth
+			for (const dependent of this.getFileDependents(next.path)) {
+				if (!seen.has(dependent)) {
+					const newDepth = currentDepth + 1
+					seen.set(dependent, newDepth)
+					queue.push({ path: dependent, depth: newDepth })
+				}
 			}
 		}
-		return seen.size
+		const files = Array.from(seen.keys()).sort()
+		const scores = Array.from(seen.entries())
+			.map(([p, depth]) => ({ path: p, depth }))
+			.sort((a, b) => a.depth - b.depth || a.path.localeCompare(b.path))
+		return { count: seen.size, files, scores }
+	}
+
+	searchSymbols(query: string, limit: number = 20): Array<{ symbol: GraphLiteSymbol; filePath: string }> {
+		if (!this.index) return []
+		const needle = query.toLowerCase().trim()
+		if (!needle) return []
+		const results: Array<{ symbol: GraphLiteSymbol; filePath: string; matchScore: number }> = []
+		for (const file of this.index.files) {
+			for (const symbol of file.symbols) {
+				const lower = symbol.name.toLowerCase()
+				let matchScore = 0
+				if (lower === needle) matchScore = 4
+				else if (lower.startsWith(needle)) matchScore = 3
+				else if (lower.includes(needle)) matchScore = 2
+				else if (needle.split('').every(ch => lower.includes(ch))) matchScore = 1
+				if (matchScore > 0) {
+					results.push({ symbol, filePath: file.path, matchScore })
+				}
+			}
+		}
+		return results
+			.sort((a, b) => b.matchScore - a.matchScore || a.filePath.localeCompare(b.filePath))
+			.slice(0, limit)
+			.map(({ symbol, filePath }) => ({ symbol, filePath }))
+	}
+
+	getCallers(filePath: string, symbolName: string): Array<{ filePath: string; symbolName: string }> {
+		const results: Array<{ filePath: string; symbolName: string }> = []
+		if (!this.index) return results
+		const targetLower = symbolName.toLowerCase()
+		for (const file of this.index.files) {
+			if (file.path === filePath) continue
+			for (const ref of file.symbolRefs) {
+				if (ref.sourcePath === filePath && ref.symbolName.toLowerCase() === targetLower) {
+					results.push({ filePath: file.path, symbolName: ref.symbolName })
+				}
+			}
+		}
+		return results
+	}
+
+	getCallees(filePath: string): Array<{ symbolName: string; sourcePath: string }> {
+		return this.findFile(filePath)?.symbolRefs ?? []
+	}
+
+	getCoChangeHints(path: string, limit: number = 10): GraphLiteCoChangeHint[] {
+		const target = this.findFile(path)
+		if (!target || !this.index) return []
+		const targetDependents = new Set(target.dependents)
+		const targetDeps = new Set(target.dependencies)
+		const hints: GraphLiteCoChangeHint[] = []
+		for (const file of this.index.files) {
+			if (file.path === target.path) continue
+			const sharedDependents = file.dependents.filter(d => targetDependents.has(d)).length
+			const sharedDependencies = file.dependencies.filter(d => targetDeps.has(d)).length
+			const score = sharedDependents * 3 + sharedDependencies * 2
+			if (score > 0) {
+				hints.push({ path: file.path, sharedDependents, sharedDependencies, score })
+			}
+		}
+		return hints.sort((a, b) => b.score - a.score).slice(0, limit)
+	}
+
+	getPackageGroups(): GraphLitePackageGroup[] {
+		if (!this.index) return []
+		const groups = new Map<string, GraphLitePackageGroup>()
+		for (const file of this.index.files) {
+			const dir = file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/')) : '.'
+			const existing = groups.get(dir)
+			if (existing) {
+				existing.files.push(file.path)
+				existing.symbolCount += file.symbols.length
+				existing.edgeCount += file.dependencies.length
+			} else {
+				groups.set(dir, {
+					directory: dir,
+					files: [file.path],
+					symbolCount: file.symbols.length,
+					edgeCount: file.dependencies.length,
+				})
+			}
+		}
+		return Array.from(groups.values()).sort(
+			(a, b) => b.files.length - a.files.length || a.directory.localeCompare(b.directory),
+		)
 	}
 
 	private findFile(path: string): GraphLiteFile | null {
@@ -307,6 +436,26 @@ function extractSymbols(content: string): GraphLiteSymbol[] {
 		symbols.push({ name, kind: keyword, line: index + 1, isExported: exported })
 	}
 	return symbols
+}
+
+function extractSymbolRefs(content: string, absPath: string, cwd: string): GraphLiteSymbolRef[] {
+	const refs: GraphLiteSymbolRef[] = []
+	const pattern = /import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g
+	for (const match of content.matchAll(pattern)) {
+		const names = match[1]?.trim()
+		const specifier = match[2]?.trim()
+		if (!names || !specifier || !specifier.startsWith('.')) continue
+		const resolved = resolveImportSpecifier(absPath, specifier, cwd)
+		if (!resolved) continue
+		for (const name of names.split(',')) {
+			const clean = name
+				.trim()
+				.replace(/\s+as\s+\w+$/, '')
+				.trim()
+			if (clean) refs.push({ symbolName: clean, sourcePath: resolved })
+		}
+	}
+	return refs
 }
 
 function normalizeQueryPath(path: string): string {

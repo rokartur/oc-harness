@@ -104,6 +104,12 @@ export function formatCompactionAttachments(ctx: CompactionContext): string {
 		parts.push(lines.join('\n'))
 	}
 
+	if (ctx.recentVerifiedWork.length > 0) {
+		const lines = ['[Compact attachment: recent verification]']
+		lines.push(...ctx.recentVerifiedWork.slice(-5))
+		parts.push(lines.join('\n'))
+	}
+
 	if (ctx.relevantMemories.length > 0) {
 		const lines = ['[Compact attachment: relevant memories]']
 		for (const m of ctx.relevantMemories) {
@@ -135,10 +141,39 @@ export function formatCompactionAttachments(ctx: CompactionContext): string {
 }
 
 const MAX_CHARS = 4000
+const TRUNCATION_SUFFIX = '\n[...truncated]'
 
-export function truncateCompactionContext(formatted: string): string {
-	if (formatted.length <= MAX_CHARS) return formatted
-	return formatted.slice(0, MAX_CHARS) + '\n[...truncated]'
+export function truncateCompactionContext(formatted: string, maxChars: number = MAX_CHARS): string {
+	if (maxChars <= 0) return ''
+	if (formatted.length <= maxChars) return formatted
+	if (maxChars <= TRUNCATION_SUFFIX.length) return TRUNCATION_SUFFIX.slice(0, maxChars)
+	return formatted.slice(0, maxChars - TRUNCATION_SUFFIX.length) + TRUNCATION_SUFFIX
+}
+
+export function buildCompactionPayload(parts: Array<string | null | undefined>, maxChars: number = MAX_CHARS): string {
+	let payload = ''
+
+	for (const part of parts) {
+		const normalized = part?.trim()
+		if (!normalized) continue
+
+		const separator = payload ? '\n\n' : ''
+		const next = `${payload}${separator}${normalized}`
+		if (next.length <= maxChars) {
+			payload = next
+			continue
+		}
+
+		const remaining = maxChars - payload.length - separator.length
+		if (remaining <= 0) break
+
+		const truncated = truncateCompactionContext(normalized, remaining)
+		if (!truncated) break
+		payload = `${payload}${separator}${truncated}`
+		break
+	}
+
+	return payload
 }
 
 export class SessionStateTracker {

@@ -18,6 +18,8 @@ export class SessionRuntimeTracker {
 	private currentTarget = ''
 	private memoryProtocol = ''
 	private memorySessionPointer = ''
+	private delegateSummary = ''
+	private commentSummary = ''
 	private doctorSummary = ''
 	private qualitySummary = ''
 	private recoverySummary = ''
@@ -65,6 +67,16 @@ export class SessionRuntimeTracker {
 
 	setMemoryProtocol(protocol: string): void {
 		this.memoryProtocol = protocol.trim()
+		this.updatedAt = Date.now()
+	}
+
+	setDelegateSummary(summary: string): void {
+		this.delegateSummary = summary.trim()
+		this.updatedAt = Date.now()
+	}
+
+	setCommentSummary(summary: string): void {
+		this.commentSummary = summary.trim()
 		this.updatedAt = Date.now()
 	}
 
@@ -135,6 +147,8 @@ export class SessionRuntimeTracker {
 			currentTarget: this.currentTarget,
 			memoryProtocol: this.memoryProtocol,
 			memorySessionPointer: this.memorySessionPointer,
+			delegateSummary: this.delegateSummary,
+			commentSummary: this.commentSummary,
 			doctorSummary: this.doctorSummary,
 			qualitySummary: this.qualitySummary,
 			recoverySummary: this.recoverySummary,
@@ -154,6 +168,8 @@ export class SessionRuntimeTracker {
 		this.currentTarget = ''
 		this.memoryProtocol = ''
 		this.memorySessionPointer = ''
+		this.delegateSummary = ''
+		this.commentSummary = ''
 		this.doctorSummary = ''
 		this.qualitySummary = ''
 		this.recoverySummary = ''

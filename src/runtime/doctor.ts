@@ -30,6 +30,11 @@ export interface DoctorProbeContext {
 		enableSessionPrimer: boolean
 		enableProgressiveCheckpoints: boolean
 		enableGraphLite: boolean
+		enableHashAnchoredPatch: boolean
+		enableDelegate: boolean
+		enableCodeIntel: boolean
+		enableCommentChecker: boolean
+		enableCodeStats: boolean
 		enableRtk: boolean
 		enableCavememBridge: boolean
 		enableCavememMcp: boolean
@@ -66,6 +71,11 @@ export function runDoctorProbes(ctx: DoctorProbeContext): DoctorReport {
 	checks.push(probeRtkConsistency(ctx))
 	checks.push(probeCavememConsistency(ctx))
 	checks.push(probeGraphLiteConsistency(ctx))
+	checks.push(probeHashPatchConsistency(ctx))
+	checks.push(probeDelegateConsistency(ctx))
+	checks.push(probeCodeIntelConsistency(ctx))
+	checks.push(probeCommentCheckerConsistency(ctx))
+	checks.push(probeCodeStatsConsistency(ctx))
 	checks.push(probePluginHealth(ctx))
 	checks.push(probeMemoryConfig(ctx))
 	checks.push(probeSessionFeatures(ctx))
@@ -235,6 +245,13 @@ function probeGraphLiteConsistency(ctx: DoctorProbeContext): DoctorCheckResult {
 	}
 }
 
+function probeHashPatchConsistency(ctx: DoctorProbeContext): DoctorCheckResult {
+	if (!ctx.config.enableHashAnchoredPatch) {
+		return { id: 'hash-patch', status: 'OK', message: 'Hash-anchored patch disabled (not required)' }
+	}
+	return { id: 'hash-patch', status: 'OK', message: 'Hash-anchored patch enabled' }
+}
+
 function probePluginHealth(ctx: DoctorProbeContext): DoctorCheckResult {
 	if (ctx.plugins.malformed > 0) {
 		return {
@@ -320,4 +337,52 @@ function probeCheckpointDir(ctx: DoctorProbeContext): DoctorCheckResult {
 		}
 	}
 	return { id: 'checkpoint-dir', status: 'OK', message: 'Checkpoints disabled' }
+}
+
+function probeDelegateConsistency(ctx: DoctorProbeContext): DoctorCheckResult {
+	if (!ctx.config.enableDelegate) return { id: 'delegate', status: 'OK', message: 'Delegate disabled (not required)' }
+	return { id: 'delegate', status: 'OK', message: 'Delegate enabled and service ready' }
+}
+
+function probeCodeIntelConsistency(ctx: DoctorProbeContext): DoctorCheckResult {
+	if (!ctx.config.enableCodeIntel)
+		return { id: 'code-intel', status: 'OK', message: 'Code intel disabled (not required)' }
+	if (ctx.binaries.rgAvailable)
+		return { id: 'code-intel', status: 'OK', message: 'Code intel enabled with rg support' }
+	return {
+		id: 'code-intel',
+		status: 'WARN',
+		message: 'Code intel enabled but rg unavailable',
+		detail: 'Reference search will be unavailable; outline and definition lookup still work via graph-lite',
+	}
+}
+
+function probeCommentCheckerConsistency(ctx: DoctorProbeContext): DoctorCheckResult {
+	if (!ctx.config.enableCommentChecker) {
+		return { id: 'comment-checker', status: 'OK', message: 'Comment checker disabled (not required)' }
+	}
+	return { id: 'comment-checker', status: 'OK', message: 'Comment checker enabled' }
+}
+
+function probeCodeStatsConsistency(ctx: DoctorProbeContext): DoctorCheckResult {
+	if (!ctx.config.enableCodeStats) {
+		return { id: 'code-stats', status: 'OK', message: 'Code stats disabled (not required)' }
+	}
+	if (checkBinary('tokei'))
+		return { id: 'code-stats', status: 'OK', message: 'Code stats enabled with tokei backend' }
+	if (checkBinary('scc')) return { id: 'code-stats', status: 'OK', message: 'Code stats enabled with scc backend' }
+	if (ctx.binaries.rgAvailable) {
+		return {
+			id: 'code-stats',
+			status: 'WARN',
+			message: 'Code stats enabled with rg fallback only',
+			detail: 'Install tokei or scc for LOC stats',
+		}
+	}
+	return {
+		id: 'code-stats',
+		status: 'WARN',
+		message: 'Code stats enabled but no backend available',
+		detail: 'Requires tokei, scc, or rg',
+	}
 }

@@ -42,6 +42,10 @@ export {
 	type GraphLiteStats,
 	type GraphLiteStatus,
 	type GraphLiteSymbol,
+	type GraphLiteSymbolRef,
+	type GraphLiteBlastRadiusDetail,
+	type GraphLiteCoChangeHint,
+	type GraphLitePackageGroup,
 } from './graph-lite.js'
 export {
 	runDoctorProbes,
@@ -77,6 +81,41 @@ export {
 	type QualityScoreResult,
 	type QualityNudge,
 } from './quality-score.js'
+export {
+	DelegateService,
+	type DelegateJob,
+	type DelegateJobStatus,
+	type DelegateAuditEntry,
+	type DelegateOptions,
+} from './delegate.js'
+export {
+	CodeIntelService,
+	type CodeIntelOutline,
+	type CodeIntelDefinition,
+	type CodeIntelSearchResult,
+	type CodeIntelOptions,
+} from './code-intel.js'
+export {
+	applyHashAnchoredPatches,
+	type HashPatchOperation,
+	type HashPatchResult,
+	type HashPatchOptions,
+	DEFAULT_MAX_PATCH_PAYLOAD_BYTES,
+	DEFAULT_MAX_SINGLE_PATCH_BYTES,
+} from './hash-patch.js'
+export { hashLine, parseAnchor, buildAnchoredView, buildAnchoredViewFromFile, type LineAnchor } from './line-hash.js'
+export {
+	CommentChecker,
+	type CommentCheckerConfig,
+	type CommentViolation,
+	type CommentCheckResult,
+} from './comment-checker.js'
+export {
+	getCodeStatsReport,
+	detectCodeStatsBackend,
+	resetCodeStatsBackendForTests,
+	type CodeStatsBackend,
+} from './code-stats.js'
 export type {
 	CompiledPrompt,
 	PromptConstraint,

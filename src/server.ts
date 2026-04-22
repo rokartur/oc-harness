@@ -26,9 +26,9 @@ import {
 import { CAVEMAN_FILE_MODES, compressContextFile } from './context/compress-file.js'
 import {
 	SessionStateTracker,
+	buildCompactionPayload,
 	buildCompactionContext,
 	formatCompactionAttachments,
-	truncateCompactionContext,
 } from './context/compaction.js'
 import {
 	createMemoryTools,
@@ -86,6 +86,7 @@ import {
 	SessionRuntimeTracker,
 	ToolArchiveManager,
 	upsertCaveKitSpec,
+	parseCaveKitSpec,
 	runDoctorProbes,
 	renderDoctorReport,
 	renderDoctorSummary,
@@ -93,14 +94,21 @@ import {
 	renderGroupedGrepOutput,
 	SessionRecoveryManager,
 	QualityScorer,
+	applyHashAnchoredPatches,
+	buildAnchoredView,
+	buildAnchoredViewFromFile,
+	CommentChecker,
+	getCodeStatsReport,
 } from './runtime/index.js'
+import { DelegateService } from './runtime/delegate.js'
+import { CodeIntelService } from './runtime/code-intel.js'
 import type { DoctorProbeContext } from './runtime/index.js'
 import { classifyVerification, combineVerificationRecords, createVerificationRecord } from './runtime/verifier.js'
 import { applyVerificationToSpec } from './runtime/backprop.js'
 import type { PluginConfig, CompatHook } from './shared/types.js'
 import { injectCavememMcp, isCavememAvailable } from './shared/cavemem.js'
 import { isRtkAvailable, resolveRtkCommandCompression } from './shared/rtk.js'
-import { fileExists, writeFileAtomic } from './shared/fs.js'
+import { fileExists, readFileText, writeFileAtomic } from './shared/fs.js'
 
 const z = toolFn.schema
 
@@ -207,6 +215,14 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		enableProgressiveCheckpoints: options?.enableProgressiveCheckpoints === true,
 		enablePersistedCheckpoints: options?.enablePersistedCheckpoints === true,
 		enableQualityScorer: options?.enableQualityScorer === true,
+		enableHashAnchoredPatch: options?.enableHashAnchoredPatch === true,
+		enableDelegate: options?.enableDelegate === true,
+		enableCodeIntel: options?.enableCodeIntel === true,
+		enableCommentChecker: options?.enableCommentChecker === true,
+		commentCheckerMode: options?.commentCheckerMode === 'block' ? 'block' : 'warn',
+		commentCheckerMinViolations:
+			typeof options?.commentCheckerMinViolations === 'number' ? options.commentCheckerMinViolations : undefined,
+		enableCodeStats: options?.enableCodeStats === true,
 		enableHostGrep: options?.enableHostGrep !== false,
 		enableHostGlob: options?.enableHostGlob !== false,
 		enableDoctor: options?.enableDoctor !== false,
@@ -358,6 +374,20 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		enabled: config.enableSessionRecovery === true,
 	})
 	const qualityScorer = new QualityScorer({ enabled: config.enableQualityScorer === true })
+	const delegateService = new DelegateService({
+		enabled: config.enableDelegate === true,
+		dataDir: join(runtimeDataDir, 'delegate'),
+		workdir: cwd,
+	})
+	const codeIntel = new CodeIntelService({
+		enabled: config.enableCodeIntel === true,
+		cwd,
+	})
+	const commentChecker = new CommentChecker({
+		enabled: config.enableCommentChecker === true,
+		severity: config.commentCheckerMode,
+		minViolations: config.commentCheckerMinViolations,
+	})
 	const qualitySignalsBySession = new Map<
 		string,
 		{
@@ -406,6 +436,11 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				enableSessionPrimer: config.enableSessionPrimer === true,
 				enableProgressiveCheckpoints: config.enableProgressiveCheckpoints === true,
 				enableGraphLite: config.enableGraphLite === true,
+				enableHashAnchoredPatch: config.enableHashAnchoredPatch === true,
+				enableDelegate: config.enableDelegate === true,
+				enableCodeIntel: config.enableCodeIntel === true,
+				enableCommentChecker: config.enableCommentChecker === true,
+				enableCodeStats: config.enableCodeStats === true,
 				enableRtk: config.enableRtk === true,
 				enableCavememBridge: config.enableCavememBridge !== false,
 				enableCavememMcp: config.enableCavememMcp !== false,
@@ -465,6 +500,210 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		const summary = audit ? `retries=${audit.totalRetries} class=${audit.lastClassification ?? 'n/a'}` : ''
 		getSessionRuntime(sessionID).setRecoverySummary(summary)
 		return summary
+	}
+
+	function refreshDelegateSummary(sessionID: string): string {
+		const summary = delegateService.renderSummary()
+		if (sessionID) getSessionRuntime(sessionID).setDelegateSummary(summary)
+		return summary
+	}
+
+	function buildGraphToolHints(input: {
+		directory: string
+		prompt: string
+		specContent?: string
+		fallbackFiles?: string[]
+	}): {
+		statusLine: string
+		ready: boolean
+		primaryFile: string
+		likelyFiles: string[]
+		symbolMatches: string[]
+		cochangeFiles: string[]
+		blastRadiusFiles: string[]
+		verificationHints: string[]
+	} {
+		const status = graphLite.getStatus()
+		const stats = status.stats
+		const statusLine = `${status.state} (${stats?.files ?? 0} files, ${stats?.symbols ?? 0} symbols${typeof stats?.symbolRefs === 'number' ? `, ${stats.symbolRefs} refs` : ''})`
+		if (!status.ready) {
+			return {
+				statusLine,
+				ready: false,
+				primaryFile: '',
+				likelyFiles: [],
+				symbolMatches: [],
+				cochangeFiles: [],
+				blastRadiusFiles: [],
+				verificationHints: [],
+			}
+		}
+
+		const parsedSpec = input.specContent ? parseCaveKitSpec(input.specContent) : null
+		const specFiles = uniqueStrings(
+			(parsedSpec?.interfaces ?? [])
+				.flatMap(line => extractReferencedPaths(line))
+				.filter(path => {
+					try {
+						return fileExists(resolveRepoLocalPath(input.directory, path))
+					} catch {
+						return false
+					}
+				}),
+		)
+		const compiled = compileUserPrompt(input.prompt)
+		const symbolMatches = uniqueStrings(
+			compiled.keywords
+				.slice(0, 3)
+				.flatMap(keyword =>
+					graphLite.searchSymbols(keyword, 3).map(result => `${result.symbol.name}@${result.filePath}`),
+				),
+		)
+		const symbolFiles = symbolMatches.map((match: string) => match.split('@').slice(-1)[0] ?? '').filter(Boolean)
+		const candidateFiles = uniqueStrings([
+			...(input.fallbackFiles ?? []),
+			...specFiles,
+			...symbolFiles,
+			...graphLite.getTopFiles(3).map(file => file.path),
+		]).filter(Boolean)
+		const primaryFile = candidateFiles[0] ?? ''
+		const cochangeFiles = primaryFile ? graphLite.getCoChangeHints(primaryFile, 3).map(hint => hint.path) : []
+		const blastRadiusFiles = primaryFile ? graphLite.getBlastRadiusDetail(primaryFile).files.slice(0, 3) : []
+		const likelyFiles = uniqueStrings([
+			primaryFile,
+			...specFiles,
+			...symbolFiles,
+			...cochangeFiles,
+			...blastRadiusFiles,
+		]).filter(Boolean)
+		const verificationHints = uniqueStrings([...blastRadiusFiles, ...cochangeFiles, ...likelyFiles.slice(1)]).slice(
+			0,
+			5,
+		)
+		return {
+			statusLine,
+			ready: true,
+			primaryFile,
+			likelyFiles: likelyFiles.slice(0, 5),
+			symbolMatches: symbolMatches.slice(0, 5),
+			cochangeFiles,
+			blastRadiusFiles,
+			verificationHints,
+		}
+	}
+
+	function renderGraphToolHintLines(hints: {
+		statusLine: string
+		ready: boolean
+		likelyFiles: string[]
+		symbolMatches: string[]
+		cochangeFiles: string[]
+		blastRadiusFiles: string[]
+		verificationHints: string[]
+	}): string[] {
+		const lines = [`Graph: ${hints.statusLine}`]
+		if (hints.likelyFiles.length > 0) lines.push(`Repo hints: ${hints.likelyFiles.join(', ')}`)
+		if (hints.symbolMatches.length > 0) lines.push(`Symbol hits: ${hints.symbolMatches.join(', ')}`)
+		if (hints.cochangeFiles.length > 0) lines.push(`Co-change risk: ${hints.cochangeFiles.join(', ')}`)
+		if (hints.blastRadiusFiles.length > 0) lines.push(`Blast radius: ${hints.blastRadiusFiles.join(', ')}`)
+		if (hints.verificationHints.length > 0) lines.push(`Verification focus: ${hints.verificationHints.join(', ')}`)
+		return lines
+	}
+
+	function uniqueStrings(values: string[]): string[] {
+		return Array.from(new Set(values))
+	}
+
+	function extractReferencedPaths(input: string): string[] {
+		return uniqueStrings(
+			Array.from(
+				input.matchAll(/(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9_.-]+)?/g),
+				match => match[0] ?? '',
+			),
+		)
+	}
+
+	function applyCommentGuardrail(sessionID: string, tool: string, args: Record<string, unknown>): void {
+		if (config.enableCommentChecker !== true) return
+		const payloads = collectCommentPayloads(tool, args)
+		if (payloads.length === 0) {
+			getSessionRuntime(sessionID).setCommentSummary('')
+			return
+		}
+		const warnings: string[] = []
+		for (const payload of payloads) {
+			const result = commentChecker.check(payload)
+			if (result.warning) warnings.push(result.warning)
+		}
+		if (warnings.length === 0) {
+			getSessionRuntime(sessionID).setCommentSummary('')
+			return
+		}
+		const summary = `${warnings.length} warning(s); mode=${commentChecker.getSeverity()}`
+		getSessionRuntime(sessionID).setCommentSummary(summary)
+		if (commentChecker.getSeverity() === 'block') {
+			throw new Error(`Comment checker blocked mutation. ${warnings[0]}`)
+		}
+	}
+
+	function collectCommentPayloads(tool: string, args: Record<string, unknown>): string[] {
+		const payloads: string[] = []
+		if (tool === 'write' && typeof args.content === 'string') payloads.push(args.content)
+		if (tool === 'edit' && typeof args.newString === 'string') payloads.push(args.newString)
+		if (tool === 'openharness_patch' && Array.isArray(args.patches)) {
+			for (const patch of args.patches) {
+				if (!patch || typeof patch !== 'object') continue
+				const next = (patch as { newContent?: unknown }).newContent
+				if (typeof next === 'string') payloads.push(next)
+			}
+		}
+		if (tool === 'openharness_cavekit_build' && Array.isArray(args.writeFiles)) {
+			for (const entry of args.writeFiles) {
+				if (!entry || typeof entry !== 'object') continue
+				const next = (entry as { content?: unknown }).content
+				if (typeof next === 'string') payloads.push(next)
+			}
+		}
+		return payloads.filter(payload => payload.includes('//') || payload.includes('#') || payload.includes('/*'))
+	}
+
+	function collectArtifactPaths(tool: string, args: Record<string, unknown>): string[] {
+		const artifacts = new Set<string>()
+		const pushPath = (filePath: unknown) => {
+			if (typeof filePath !== 'string' || !filePath.trim()) return
+			try {
+				artifacts.add(toDisplayPath(cwd, resolveRepoLocalPath(cwd, filePath)))
+			} catch {
+				artifacts.add(filePath.trim())
+			}
+		}
+
+		if (tool === 'read' || tool === 'write' || tool === 'edit' || tool === 'openharness_caveman_compress_file') {
+			pushPath(args.filePath)
+		}
+		if (tool === 'glob' && typeof args.pattern === 'string' && args.pattern.trim()) {
+			artifacts.add(args.pattern.trim())
+		}
+		if (tool === 'openharness_patch') {
+			pushPath(args.file)
+		}
+		if (tool === 'openharness_cavekit_spec' || tool === 'openharness_cavekit_backprop') {
+			artifacts.add(toDisplayPath(cwd, resolveCaveKitSpecPath(cwd)))
+		}
+		if (tool === 'openharness_cavekit_build') {
+			artifacts.add(toDisplayPath(cwd, resolveCaveKitSpecPath(cwd)))
+			if (Array.isArray(args.writeFiles)) {
+				for (const entry of args.writeFiles) {
+					if (!entry || typeof entry !== 'object') continue
+					pushPath((entry as { path?: unknown }).path)
+				}
+			}
+			if (Array.isArray(args.deleteFiles)) {
+				for (const entry of args.deleteFiles) pushPath(entry)
+			}
+		}
+
+		return Array.from(artifacts)
 	}
 
 	function getSessionState(sessionID: string): SessionStateTracker {
@@ -703,6 +942,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		if (toolName === 'openharness_caveman_compress_file' && typeof args.filePath === 'string') {
 			capturePaths.push(resolveRepoLocalPath(cwd, args.filePath))
 		}
+		if (toolName === 'openharness_patch' && typeof args.file === 'string') {
+			capturePaths.push(resolveRepoLocalPath(cwd, args.file))
+		}
 		for (const absPath of capturePaths) snapshotManager.capture(cwd, sessionID, absPath)
 	}
 
@@ -868,10 +1110,24 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				},
 			}),
 			openharness_graph_query: toolFn({
-				description: 'Query graph-lite file importance, symbols, dependencies, dependents, or blast radius.',
+				description:
+					'Query graph-lite file importance, symbols, dependencies, dependents, blast radius, callers, callees, cochange hints, package groups, and symbol search.',
 				args: {
-					action: z.enum(['top_files', 'file_symbols', 'file_deps', 'file_dependents', 'blast_radius']),
+					action: z.enum([
+						'top_files',
+						'file_symbols',
+						'file_deps',
+						'file_dependents',
+						'blast_radius',
+						'blast_radius_detail',
+						'search_symbols',
+						'callers',
+						'callees',
+						'cochange',
+						'package_groups',
+					]),
 					file: z.string().optional().describe('Repo-local file path for file-scoped graph queries'),
+					query: z.string().optional().describe('Search query for symbol search'),
 					limit: z.number().optional().describe('Optional result limit'),
 				},
 				async execute(args) {
@@ -884,6 +1140,29 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							.map(
 								row =>
 									`- ${row.path} (score ${row.score.toFixed(2)}, ${row.lines} lines, ${row.symbols} symbols)`,
+							)
+							.join('\n')
+					}
+					if (args.action === 'search_symbols') {
+						const query = args.query ?? ''
+						if (!query) return 'query parameter required for search_symbols'
+						const results = graphLite.searchSymbols(query, args.limit ?? 20)
+						if (results.length === 0) return `No symbols matching '${query}'`
+						return results
+							.map(
+								r =>
+									`- ${r.symbol.name} (${r.symbol.kind}) [${r.filePath}:${r.symbol.line}]${r.symbol.isExported ? ' [exported]' : ''}`,
+							)
+							.join('\n')
+					}
+					if (args.action === 'package_groups') {
+						const groups = graphLite.getPackageGroups()
+						if (groups.length === 0) return 'No indexed files.'
+						return groups
+							.slice(0, args.limit ?? 20)
+							.map(
+								g =>
+									`- ${g.directory}/ (${g.files.length} files, ${g.symbolCount} symbols, ${g.edgeCount} edges)`,
 							)
 							.join('\n')
 					}
@@ -917,7 +1196,47 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 									.join('\n')
 							: `No dependents found for ${args.file}`
 					}
-					return `Blast radius for ${args.file}: ${graphLite.getBlastRadius(args.file)} file(s)`
+					if (args.action === 'blast_radius') {
+						return `Blast radius for ${args.file}: ${graphLite.getBlastRadius(args.file)} file(s)`
+					}
+					if (args.action === 'blast_radius_detail') {
+						const detail = graphLite.getBlastRadiusDetail(args.file)
+						if (detail.count === 0) return `No blast radius for ${args.file}`
+						const lines = [`Blast radius for ${args.file}: ${detail.count} file(s)`, '']
+						for (const entry of detail.scores.slice(0, args.limit ?? 20)) {
+							lines.push(`- ${entry.path} (depth ${entry.depth})`)
+						}
+						return lines.join('\n')
+					}
+					if (args.action === 'callers') {
+						const symName = args.query ?? ''
+						if (!symName) return 'query parameter (symbol name) required for callers'
+						const callers = graphLite.getCallers(args.file, symName)
+						if (callers.length === 0) return `No callers of ${symName} from ${args.file}`
+						return callers
+							.slice(0, args.limit ?? 20)
+							.map(c => `- ${c.filePath} (imports ${c.symbolName})`)
+							.join('\n')
+					}
+					if (args.action === 'callees') {
+						const callees = graphLite.getCallees(args.file)
+						if (callees.length === 0) return `No named imports found for ${args.file}`
+						return callees
+							.slice(0, args.limit ?? 20)
+							.map(c => `- ${c.symbolName} from ${c.sourcePath}`)
+							.join('\n')
+					}
+					if (args.action === 'cochange') {
+						const hints = graphLite.getCoChangeHints(args.file, args.limit ?? 10)
+						if (hints.length === 0) return `No co-change hints for ${args.file}`
+						return hints
+							.map(
+								h =>
+									`- ${h.path} (shared deps=${h.sharedDependencies}, shared dependents=${h.sharedDependents}, score=${h.score})`,
+							)
+							.join('\n')
+					}
+					return 'Unknown action'
 				},
 			}),
 			openharness_fs_undo: toolFn({
@@ -933,6 +1252,50 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						`Restored from: ${new Date(restored.timestamp).toISOString()}`,
 						`State: ${restored.exists ? 'restored prior content' : 'deleted file restored to missing state'}`,
 					].join('\n')
+				},
+			}),
+			openharness_patch: toolFn({
+				description:
+					'View hash anchors for a file or apply small hash-anchored patches atomically. Use this for drift-safe targeted edits.',
+				args: {
+					action: z.enum(['view', 'apply']).describe('view anchors or apply patch operations'),
+					file: z.string().describe('Repo-local file path'),
+					startLine: z.number().optional().describe('Optional start line for anchored view'),
+					endLine: z.number().optional().describe('Optional end line for anchored view'),
+					patches: z
+						.array(
+							z.object({
+								anchor: z.string().optional(),
+								anchorStart: z.string().optional(),
+								anchorEnd: z.string().optional(),
+								newContent: z.string(),
+							}),
+						)
+						.optional()
+						.describe('Ordered anchored patch operations for apply mode'),
+				},
+				async execute(args, ctx) {
+					if (config.enableHashAnchoredPatch !== true) return 'Hash-anchored patch disabled by config.'
+					try {
+						const targetPath = resolveRepoLocalPath(ctx.directory, args.file)
+						if (args.action === 'view') {
+							const content = args.startLine || args.endLine ? (readFileText(targetPath) ?? '') : ''
+							const view =
+								args.startLine || args.endLine
+									? buildAnchoredView(content, args.startLine ?? 1, args.endLine)
+									: buildAnchoredViewFromFile(targetPath)
+							return [`File: ${toDisplayPath(ctx.directory, targetPath)}`, '', view || 'No lines.'].join(
+								'\n',
+							)
+						}
+						if (!args.patches || args.patches.length === 0)
+							return 'patches parameter required for apply mode'
+						const result = applyHashAnchoredPatches(targetPath, args.patches)
+						if (!result.ok) return `ERROR: ${result.error}`
+						return [`OK — ${toDisplayPath(ctx.directory, result.path)}`, ...result.report].join('\n')
+					} catch (error) {
+						return `ERROR: ${error instanceof Error ? error.message : String(error)}`
+					}
 				},
 			}),
 			openharness_cavemem_recall: toolFn({
@@ -1139,10 +1502,17 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					})
 					const runtime = getSessionRuntime(ctx.sessionID)
 					const firstTask = result.selectedTasks[0]
+					const graphHints = buildGraphToolHints({
+						directory: ctx.directory,
+						prompt: [args.focus, result.goal, ...result.selectedTasks.map(task => task.task)]
+							.filter(Boolean)
+							.join('. '),
+						specContent: result.content,
+					})
 					if (firstTask) {
-						runtime.setCurrentTarget(firstTask.task)
+						runtime.setCurrentTarget(graphHints.primaryFile || firstTask.task)
 						runtime.setNextStep(
-							`Implement ${firstTask.id} and verify with ${result.validationCommands.join(' + ') || 'project checks'}.`,
+							`Implement ${firstTask.id}${graphHints.primaryFile ? ` around ${graphHints.primaryFile}` : ''} and verify with ${result.validationCommands.join(' + ') || 'project checks'}.`,
 						)
 					}
 					const executedEdits = applyBuildFileEdits(
@@ -1203,6 +1573,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						`Path: ${toDisplayPath(ctx.directory, result.path)}`,
 						`Goal: ${result.goal}`,
 						`Task coverage: ${result.taskCoverage}`,
+						...renderGraphToolHintLines(graphHints),
 						`Changed: ${result.changed ? 'yes' : 'no'}`,
 						`Executed writes: ${executedEdits.written.join(', ') || 'none'}`,
 						`Executed deletes: ${executedEdits.deleted.join(', ') || 'none'}`,
@@ -1220,6 +1591,11 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				},
 				async execute(args, ctx) {
 					const result = checkCaveKitDrift(ctx.directory, args.focus)
+					const graphHints = buildGraphToolHints({
+						directory: ctx.directory,
+						prompt: args.focus?.trim() || result.goal,
+						specContent: result.content,
+					})
 					const lines = [
 						'## CaveKit Check',
 						'',
@@ -1227,6 +1603,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						`Goal: ${result.goal}`,
 						`Task coverage: ${result.taskCoverage}`,
 						`Verify: ${result.validationCommands.join(' ; ') || 'n/a'}`,
+						...renderGraphToolHintLines(graphHints),
 						'',
 						'### Findings',
 					]
@@ -1341,18 +1718,22 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			openharness_hook_log: createHookLogTool(() => hookLog),
 			openharness_runtime_status: createRuntimeStatusTool(sessionID => {
 				if (!sessionID) return null
+				refreshDelegateSummary(sessionID)
 				return getSessionRuntime(sessionID).snapshot()
 			}),
 			openharness_telemetry_snapshot: createTelemetrySnapshotTool(sessionID => {
 				if (!sessionID) return null
+				refreshDelegateSummary(sessionID)
 				return getSessionRuntime(sessionID).snapshot()
 			}),
 			openharness_benchmark_snapshot: createBenchmarkSnapshotTool(sessionID => {
 				if (!sessionID) return null
+				refreshDelegateSummary(sessionID)
 				return getSessionRuntime(sessionID).snapshot()
 			}),
 			openharness_caveman_stack_status: createRuntimeStatusTool(sessionID => {
 				if (!sessionID) return null
+				refreshDelegateSummary(sessionID)
 				return getSessionRuntime(sessionID).snapshot()
 			}),
 			openharness_doctor: toolFn({
@@ -1384,10 +1765,138 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					return qualityScorer.renderQuality(result)
 				},
 			}),
+			openharness_delegate_start: toolFn({
+				description:
+					'Start a bounded background delegate job (index, review, research) with explicit status/audit visibility.',
+				args: {
+					label: z.string().describe('Human-readable label for the job'),
+					kind: z.enum(['index', 'review', 'research', 'custom']).describe('Job category'),
+					command: z.string().describe('Shell command to execute'),
+				},
+				async execute(args, ctx) {
+					const job = delegateService.start(args.label, args.kind, args.command)
+					refreshDelegateSummary(ctx.sessionID)
+					return [
+						`Job: ${job.id}`,
+						`Label: ${job.label}`,
+						`Kind: ${job.kind}`,
+						`Status: ${job.status}`,
+						job.error ? `Error: ${job.error}` : 'Queued for execution.',
+					].join('\n')
+				},
+			}),
+			openharness_delegate_status: toolFn({
+				description: 'Check the status of a delegate job.',
+				args: {
+					id: z.string().describe('Job ID returned by openharness_delegate_start'),
+				},
+				async execute(args, ctx) {
+					const job = delegateService.getStatus(args.id)
+					refreshDelegateSummary(ctx.sessionID)
+					if (!job) return `Job '${args.id}' not found.`
+					const lines = [
+						`Job: ${job.id}`,
+						`Label: ${job.label}`,
+						`Kind: ${job.kind}`,
+						`Status: ${job.status}`,
+						`Command: ${job.command}`,
+					]
+					if (job.startedAt) lines.push(`Started: ${new Date(job.startedAt).toISOString()}`)
+					if (job.completedAt) lines.push(`Completed: ${new Date(job.completedAt).toISOString()}`)
+					if (job.exitCode !== null) lines.push(`Exit code: ${job.exitCode}`)
+					if (job.output) lines.push(`Output: ${job.output.slice(0, 2000)}`)
+					if (job.error) lines.push(`Error: ${job.error.slice(0, 1000)}`)
+					return lines.join('\n')
+				},
+			}),
+			openharness_delegate_list: toolFn({
+				description: 'List delegate jobs with optional status filter.',
+				args: {
+					status: z
+						.enum(['pending', 'running', 'done', 'failed', 'cancelled'])
+						.optional()
+						.describe('Optional status filter'),
+				},
+				async execute(args, ctx) {
+					const jobs = delegateService.list(args.status as any)
+					refreshDelegateSummary(ctx.sessionID)
+					if (jobs.length === 0) return args.status ? `No ${args.status} delegate jobs.` : 'No delegate jobs.'
+					return jobs
+						.slice(-20)
+						.map(j => `- ${j.id} [${j.status}] ${j.label} (${j.kind})`)
+						.join('\n')
+				},
+			}),
+			openharness_delegate_audit: toolFn({
+				description: 'Show delegate audit trail with recent bounded background jobs.',
+				args: {},
+				async execute(_args, ctx) {
+					refreshDelegateSummary(ctx.sessionID)
+					return delegateService.renderAudit()
+				},
+			}),
+			openharness_intel_outline: toolFn({
+				description:
+					'Show a read-only symbol outline for a file (AST-like: functions, classes, interfaces, types, exports).',
+				args: {
+					file: z.string().describe('Repo-local file path'),
+				},
+				async execute(args) {
+					const outline = codeIntel.getOutline(args.file)
+					if (!outline)
+						return `No outline available for ${args.file} (file not found or code intel disabled).`
+					const lines = [`## Outline: ${outline.filePath}`, `Lines: ${outline.lineCount}`, '']
+					for (const sym of outline.symbols) {
+						lines.push(`- L${sym.line} ${sym.kind} ${sym.name}${sym.isExported ? ' [exported]' : ''}`)
+					}
+					if (outline.symbols.length === 0) lines.push('No symbols found.')
+					return lines.join('\n')
+				},
+			}),
+			openharness_intel_definition: toolFn({
+				description: 'Find the definition(s) of a symbol using graph-lite indexed exports.',
+				args: {
+					symbol: z.string().describe('Symbol name to search for'),
+				},
+				async execute(args) {
+					const defs = codeIntel.findDefinition(args.symbol, graphLite)
+					if (defs.length === 0)
+						return `No definitions found for '${args.symbol}'. Ensure graph-lite is indexed.`
+					return defs.map(d => `- ${d.symbolName} (${d.kind}) at ${d.filePath}:${d.line}`).join('\n')
+				},
+			}),
+			openharness_intel_references: toolFn({
+				description: 'Find all references to a symbol using rg (read-only, no LSP required).',
+				args: {
+					symbol: z.string().describe('Symbol name to search references for'),
+					include: z.string().optional().describe('Optional glob pattern to filter files'),
+					limit: z.number().optional().describe('Max results (default 50)'),
+				},
+				async execute(args) {
+					const refs = codeIntel.findReferences(args.symbol, args.include, args.limit ?? 50)
+					if (refs.length === 0) return `No references found for '${args.symbol}'. Requires rg.`
+					return refs.map(r => `- ${r.filePath}:${r.line}:${r.column} ${r.text}`).join('\n')
+				},
+			}),
+			openharness_code_stats: toolFn({
+				description:
+					'Language and file statistics for the repo or a repo-local subdirectory. Uses tokei, then scc, then rg fallback.',
+				args: {
+					path: z.string().optional().describe('Optional repo-local subdirectory to analyze'),
+				},
+				async execute(args, ctx) {
+					if (config.enableCodeStats !== true) return 'Code stats disabled by config.'
+					const targetPath = args.path ? resolveRepoLocalPath(ctx.directory, args.path) : ctx.directory
+					return getCodeStatsReport(targetPath)
+				},
+			}),
 		},
 
 		'tool.execute.before':
-			config.enableHooks || config.enableRtk || config.enableSnapshots === true
+			config.enableHooks ||
+			config.enableRtk ||
+			config.enableSnapshots === true ||
+			config.enableCommentChecker === true
 				? async (hookInput, output) => {
 						maybeCaptureHarnessSnapshots(
 							hookInput.tool,
@@ -1409,6 +1918,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 								throw new Error(`Blocked by OpenHarness hook for tool '${hookInput.tool}'`)
 							}
 						}
+
+						applyCommentGuardrail(
+							hookInput.sessionID,
+							hookInput.tool,
+							(output.args ?? {}) as Record<string, unknown>,
+						)
 
 						if (config.enableRtk && hookInput.tool === 'bash') {
 							const command = typeof output.args?.command === 'string' ? output.args.command : ''
@@ -1529,18 +2044,13 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					signals.archivePressure += 1
 				}
 			}
-			if (hookInput.tool === 'read' || hookInput.tool === 'glob') {
-				const path =
-					typeof hookInput.args?.filePath === 'string'
-						? hookInput.args.filePath
-						: typeof hookInput.args?.pattern === 'string'
-							? hookInput.args.pattern
-							: ''
-				if (path) {
-					sessionState.addArtifact(path)
-					sessionRuntime.setCurrentTarget(path)
-					checkpointManager.recordFileActivity(hookInput.sessionID, path)
+			const touchedArtifacts = collectArtifactPaths(hookInput.tool, hookInput.args ?? {})
+			if (touchedArtifacts.length > 0) {
+				for (const artifact of touchedArtifacts) {
+					sessionState.addArtifact(artifact)
+					checkpointManager.recordFileActivity(hookInput.sessionID, artifact)
 				}
+				sessionRuntime.setCurrentTarget(touchedArtifacts[0] ?? '')
 			}
 			if (
 				config.enablePendingTodoReminders === true &&
@@ -1628,11 +2138,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					searchDefaultLimit: cavememSettings.searchDefaultLimit,
 				})
 				const formatted = formatCompactionAttachments(ctx)
-				if (formatted) {
-					output.context.push(truncateCompactionContext(formatted))
-				}
 				const restoreContext = checkpointManager.buildRestoreContext(hookInput.sessionID)
-				if (restoreContext) output.context.push(restoreContext)
+				const payload = buildCompactionPayload([formatted, restoreContext])
+				if (payload) output.context.push(payload)
 			}
 		},
 
@@ -1858,6 +2366,26 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					? await recallProjectMemories(prompt, cwd, hookInput.sessionID, 3)
 					: []
 				const discoveryHints = primerSeed.topFiles
+				const graphStatus = graphLite.getStatus()
+				const graphReady = graphStatus.ready
+				const graphCochangeHints =
+					graphReady && discoveryHints.length > 0
+						? graphLite.getCoChangeHints(discoveryHints[0], 3).map(h => ({ path: h.path, score: h.score }))
+						: []
+				const graphBlastRadiusFiles =
+					graphReady && discoveryHints.length > 0
+						? graphLite.getBlastRadiusDetail(discoveryHints[0]).files.slice(0, 3)
+						: []
+				const graphSymbolMatches =
+					graphReady && compiledPrompt.keywords.length > 0
+						? compiledPrompt.keywords
+								.slice(0, 2)
+								.flatMap(kw =>
+									graphLite
+										.searchSymbols(kw, 3)
+										.map(r => ({ symbolName: r.symbol.name, filePath: r.filePath })),
+								)
+						: []
 				const sessionState = getSessionState(hookInput.sessionID)
 				const plan = buildExecutionPlan({
 					compiledPrompt,
@@ -1865,6 +2393,9 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					memories: planningMemories,
 					taskFocus: sessionState.getTaskFocus(),
 					discoveryHints,
+					graphCochangeHints,
+					graphBlastRadiusFiles,
+					graphSymbolMatches,
 				})
 				sessionRuntime.setPlan(plan)
 				sessionState.updateGoal(plan.goal)

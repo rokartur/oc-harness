@@ -18,6 +18,7 @@ export {
 export {
 	SessionStateTracker,
 	buildCompactionContext,
+	buildCompactionPayload,
 	formatCompactionAttachments,
 	truncateCompactionContext,
 	type TaskFocusState,

@@ -265,6 +265,8 @@ export function createRuntimeStatusTool(
 			if (snapshot.currentTarget) lines.push(`Current target: ${snapshot.currentTarget}`)
 			if (snapshot.memoryProtocol) lines.push(`Memory protocol: ${snapshot.memoryProtocol}`)
 			if (snapshot.memorySessionPointer) lines.push(`Memory session: ${snapshot.memorySessionPointer}`)
+			if (snapshot.delegateSummary) lines.push(`Delegate: ${snapshot.delegateSummary}`)
+			if (snapshot.commentSummary) lines.push(`Comment guardrail: ${snapshot.commentSummary}`)
 			if (snapshot.doctorSummary) lines.push(`Doctor: ${snapshot.doctorSummary}`)
 			if (snapshot.qualitySummary) lines.push(`Quality: ${snapshot.qualitySummary}`)
 			if (snapshot.recoverySummary) lines.push(`Recovery: ${snapshot.recoverySummary}`)
@@ -276,6 +278,9 @@ export function createRuntimeStatusTool(
 				lines.push(`Goal: ${snapshot.plan.goal}`)
 				lines.push(`Active plan: ${snapshot.plan.summary}`)
 				lines.push(`Task coverage: ${formatTaskCoverage(snapshot.plan)}`)
+				if (snapshot.plan.sourceArtifacts.length > 0) {
+					lines.push(`Sources: ${snapshot.plan.sourceArtifacts.slice(0, 6).join(', ')}`)
+				}
 				if (snapshot.plan.steps.length > 0) {
 					lines.push('', '### Steps')
 					for (const step of snapshot.plan.steps.slice(0, 5)) {
@@ -328,6 +333,8 @@ export function createTelemetrySnapshotTool(
 			if (snapshot.currentTarget) lines.push(`Current target: ${snapshot.currentTarget}`)
 			if (snapshot.memoryProtocol) lines.push(`Memory protocol: ${snapshot.memoryProtocol}`)
 			if (snapshot.memorySessionPointer) lines.push(`Memory: ${snapshot.memorySessionPointer}`)
+			if (snapshot.delegateSummary) lines.push(`Delegate: ${snapshot.delegateSummary}`)
+			if (snapshot.commentSummary) lines.push(`Comment guardrail: ${snapshot.commentSummary}`)
 			if (snapshot.doctorSummary) lines.push(`Doctor: ${snapshot.doctorSummary}`)
 			if (snapshot.qualitySummary) lines.push(`Quality: ${snapshot.qualitySummary}`)
 			if (snapshot.recoverySummary) lines.push(`Recovery: ${snapshot.recoverySummary}`)
@@ -365,6 +372,8 @@ export function createBenchmarkSnapshotTool(
 				currentTarget: snapshot.currentTarget,
 				memoryProtocol: snapshot.memoryProtocol,
 				memorySessionPointer: snapshot.memorySessionPointer,
+				delegateSummary: snapshot.delegateSummary ?? '',
+				commentSummary: snapshot.commentSummary,
 				doctorSummary: snapshot.doctorSummary,
 				qualitySummary: snapshot.qualitySummary,
 				recoverySummary: snapshot.recoverySummary,
@@ -384,6 +393,7 @@ export function createBenchmarkSnapshotTool(
 				`Task coverage: ${benchmark.taskCoverage}`,
 				`Current target: ${benchmark.currentTarget || 'n/a'}`,
 				`Memory protocol: ${benchmark.memoryProtocol || 'n/a'}`,
+				`Delegate: ${benchmark.delegateSummary || 'n/a'}`,
 				`Doctor: ${benchmark.doctorSummary || 'n/a'}`,
 				`Quality: ${benchmark.qualitySummary || 'n/a'}`,
 				`Recovery: ${benchmark.recoverySummary || 'n/a'}`,

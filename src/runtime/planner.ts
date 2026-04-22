@@ -17,6 +17,9 @@ export function buildExecutionPlan(input: {
 	memories: MemoryHeader[]
 	taskFocus: TaskFocusState
 	discoveryHints?: string[]
+	graphCochangeHints?: Array<{ path: string; score: number }>
+	graphBlastRadiusFiles?: string[]
+	graphSymbolMatches?: Array<{ symbolName: string; filePath: string }>
 }): ExecutionPlan {
 	const spec = input.rootContext.find(ctx => ctx.label === 'CaveKit Spec')
 	const parsedSpec = spec ? parseCaveKitSpec(spec.content) : null
@@ -27,6 +30,9 @@ export function buildExecutionPlan(input: {
 	const sourceArtifacts = uniqueStrings([
 		...input.rootContext.map(ctx => ctx.label),
 		...discoveryHints.slice(0, 3).map(hint => `GraphLite Hint: ${hint}`),
+		...(input.graphCochangeHints?.slice(0, 2).map(h => `Cochange: ${h.path}`) ?? []),
+		...(input.graphBlastRadiusFiles?.slice(0, 2).map(f => `Blast: ${f}`) ?? []),
+		...(input.graphSymbolMatches?.slice(0, 3).map(s => `Symbol: ${s.symbolName}@${s.filePath}`) ?? []),
 	])
 	const memoryRefs = input.memories.map(memory => memory.title)
 
@@ -63,7 +69,14 @@ export function buildExecutionPlan(input: {
 		return {
 			mode,
 			goal: specDetails.goal || input.compiledPrompt.goal,
-			summary: buildSpecSummary(selectedTasks, validationCommands, specDetails, discoveryHints),
+			summary: buildSpecSummary(
+				selectedTasks,
+				validationCommands,
+				specDetails,
+				discoveryHints,
+				input.graphCochangeHints,
+				input.graphBlastRadiusFiles,
+			),
 			steps: plannedSteps,
 			sourceArtifacts,
 			specSource: spec?.source ?? '',
@@ -147,17 +160,30 @@ function buildSpecSummary(
 	validationCommands: string[],
 	spec: ParsedCaveKitSpec | null,
 	discoveryHints: string[],
+	cochangeHints?: Array<{ path: string; score: number }>,
+	blastRadiusFiles?: string[],
 ): string {
 	const taskSummary = tasks.map(task => `${task.id}:${task.task}`).join(' | ')
 	const guardrails = spec
 		? uniqueStrings([...spec.constraints.slice(0, 1), ...spec.invariants.slice(0, 2)]).join(' | ')
 		: ''
 	const hints = discoveryHints.length > 0 ? ` Likely files: ${discoveryHints.slice(0, 3).join(', ')}.` : ''
+	const cochange =
+		cochangeHints && cochangeHints.length > 0
+			? ` Co-change risk: ${cochangeHints
+					.slice(0, 2)
+					.map(h => h.path)
+					.join(', ')}.`
+			: ''
+	const blast =
+		blastRadiusFiles && blastRadiusFiles.length > 0
+			? ` Blast radius files: ${blastRadiusFiles.slice(0, 2).join(', ')}.`
+			: ''
 	const verification =
 		validationCommands.length > 0 ? ` Verify with ${formatValidationList(validationCommands)}.` : ''
 	const taskClause = taskSummary ? `Advance ${taskSummary}.` : 'No open CaveKit tasks. Validate current state.'
 	const guardrailClause = guardrails ? ` Preserve ${guardrails}.` : ''
-	return `SPEC-backed plan. ${taskClause}${guardrailClause}${hints}${verification}`.trim()
+	return `SPEC-backed plan. ${taskClause}${guardrailClause}${hints}${cochange}${blast}${verification}`.trim()
 }
 
 function buildAdHocSteps(

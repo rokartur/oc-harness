@@ -24,6 +24,7 @@ export interface SessionPrimerSnapshot {
 	tier: PrimerTier
 	graphFileCount: number
 	graphSymbolCount: number
+	graphSymbolRefCount: number
 	pendingTodoCount: number
 	latestVerificationStatus: string
 	qualityGrade: QualityGrade | ''
@@ -31,7 +32,7 @@ export interface SessionPrimerSnapshot {
 }
 
 export interface SessionPrimerGraphSource {
-	getStatus(): { state: string; ready: boolean; stats?: { files: number; symbols: number } }
+	getStatus(): { state: string; ready: boolean; stats?: { files: number; symbols: number; symbolRefs?: number } }
 	getTopFiles(limit?: number): Array<{ path: string }>
 }
 
@@ -69,6 +70,7 @@ export class SessionPrimer {
 		const graphReady = graphStatusObj?.ready ?? false
 		const graphFileCount = graphStatusObj?.stats?.files ?? 0
 		const graphSymbolCount = graphStatusObj?.stats?.symbols ?? 0
+		const graphSymbolRefCount = (graphStatusObj?.stats as { symbolRefs?: number } | undefined)?.symbolRefs ?? 0
 		const topFiles = graphReady ? input.graph!.getTopFiles(this.maxTopFiles).map(file => file.path) : []
 
 		const changedFilesCount = countChangedFiles(input.cwd)
@@ -98,6 +100,7 @@ export class SessionPrimer {
 			tier,
 			graphFileCount,
 			graphSymbolCount,
+			graphSymbolRefCount,
 			pendingTodoCount: input.pendingTodoCount ?? 0,
 			latestVerificationStatus: input.latestVerificationStatus ?? '',
 			qualityGrade: input.qualityGrade ?? '',
@@ -124,7 +127,9 @@ export class SessionPrimer {
 		lines.push(`Changed files: ${snapshot.changedFilesCount}`)
 		lines.push(`Graph: ${snapshot.graphStatus} (${snapshot.graphFreshness})`)
 		if (snapshot.graphFileCount > 0) {
-			lines.push(`Graph stats: ${snapshot.graphFileCount} files, ${snapshot.graphSymbolCount} symbols`)
+			lines.push(
+				`Graph stats: ${snapshot.graphFileCount} files, ${snapshot.graphSymbolCount} symbols${snapshot.graphSymbolRefCount > 0 ? `, ${snapshot.graphSymbolRefCount} refs` : ''}`,
+			)
 		}
 		if (snapshot.pendingTodoCount > 0) {
 			lines.push(`Pending todos: ${snapshot.pendingTodoCount}`)
@@ -148,7 +153,10 @@ export class SessionPrimer {
 		const parts = [`tier=${snapshot.tier}`, `mode=${snapshot.planMode}`]
 		if (snapshot.gitBranch) parts.push(`branch=${snapshot.gitBranch}`)
 		if (snapshot.changedFilesCount > 0) parts.push(`changes=${snapshot.changedFilesCount}`)
-		if (snapshot.graphFileCount > 0) parts.push(`graph=${snapshot.graphFileCount}f/${snapshot.graphSymbolCount}s`)
+		if (snapshot.graphFileCount > 0)
+			parts.push(
+				`graph=${snapshot.graphFileCount}f/${snapshot.graphSymbolCount}s${snapshot.graphSymbolRefCount > 0 ? `/${snapshot.graphSymbolRefCount}r` : ''}`,
+			)
 		if (snapshot.qualityGrade) parts.push(`quality=${snapshot.qualityGrade}`)
 		return parts.join(' | ')
 	}

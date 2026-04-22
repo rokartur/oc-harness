@@ -123,6 +123,13 @@ export interface PluginConfig {
 	enableProgressiveCheckpoints?: boolean
 	enablePersistedCheckpoints?: boolean
 	enableQualityScorer?: boolean
+	enableHashAnchoredPatch?: boolean
+	enableDelegate?: boolean
+	enableCodeIntel?: boolean
+	enableCommentChecker?: boolean
+	commentCheckerMode?: 'warn' | 'block'
+	commentCheckerMinViolations?: number
+	enableCodeStats?: boolean
 	enableHostGrep?: boolean
 	enableHostGlob?: boolean
 	enableDoctor?: boolean
